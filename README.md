@@ -67,21 +67,17 @@ Assembly goes as follows (see also pictures below):
 - fix the 3D printed stepper motor cover to the stepper motor mounting bracket with two of the M3&nbsp;x&nbsp;10&nbsp;mm hex head bolts,
 - fix the 3D printed lid into position over the electronics with the remaining M3&nbsp;x&nbsp;10&nbsp;mm hex head bolt.
 
-<img src="pictures_for_readme/mechanism_mounted.jpg" alt="Mechanism mounted" style="width:20%; height:auto;">
-<img src="pictures_for_readme/voltage_regulator_board_fitted.jpg" alt="Voltage regulator board fitted" style="width:20%; height:auto;">
-<img src="pictures_for_readme/boards_clipped_in.jpg" alt="Boards clipped in" style="width:20%; height:auto;">
-<img src="pictures_for_readme/stepper_motor_wires_ready.jpg" alt="Stepper motor wires trimmed and connector fitted" style="width:20%; height:auto;">
-<img src="pictures_for_readme/wheel_grub_screw_hole_tapped.jpg" alt="Wheel grub screw hole tapped" style="width:20%; height:auto;">
-<img src="pictures_for_readme/wheel_and_stepper_motor_fixed.jpg" alt="Wheel and stepper motor fixed" style="width:20%; height:auto;">
-<img src="pictures_for_readme/y_wire_before_heatshrink.jpg" alt="Y-wire before heatshrink" style="width:20%; height:auto;">
-<img src="pictures_for_readme/y_wire_after_heatshrink.jpg" alt="Y-wire after heatshrink" style="width:20%; height:auto;">
-<img src="pictures_for_readme/schematic.png" alt="Schematic" style="width:20%; height:auto;">
-<img src="pictures_for_readme/wiring_1.jpg" alt="Wires cut to length and connectors fitted" style="width:20%; height:auto;">
-<img src="pictures_for_readme/wiring_2.jpg" alt="Wiring completed" style="width:20%; height:auto;">
-<img src="pictures_for_readme/12v_input.jpg" alt="12 V input socket with wires attached and heatshrinked" style="width:20%; height:auto;">
-<img src="pictures_for_readme/12v_input_fitted.jpg" alt="12 V input socket fitted" style="width:20%; height:auto;">
-<img src="pictures_for_readme/red_led_lit.jpg" alt="12 V plugged in, LED lit" style="width:20%; height:auto;">
-<img src="pictures_for_readme/covers_fitted.jpg" alt="Covers fitted" style="width:20%; height:auto;">
+<img src="pictures_for_readme/mechanism_mounted.jpg" alt="Mechanism mounted" style="width:35%; height:auto;"> <img src="pictures_for_readme/voltage_regulator_board_fitted.jpg" alt="Voltage regulator board fitted" style="width:32%; height:auto;"> <img src="pictures_for_readme/boards_clipped_in.jpg" alt="Boards clipped in" style="width:23.5%; height:auto;">
+
+<img src="pictures_for_readme/stepper_motor_wires_ready.jpg" alt="Stepper motor wires trimmed and connector fitted" style="width:31%; height:auto;"> <img src="pictures_for_readme/wheel_grub_screw_hole_tapped.jpg" alt="Wheel grub screw hole tapped" style="width:34%; height:auto;"> <img src="pictures_for_readme/wheel_and_stepper_motor_fixed.jpg" alt="Wheel and stepper motor fixed" style="width:32%; height:auto;">
+
+<img src="pictures_for_readme/y_wire_before_heatshrink.jpg" alt="Y-wire before heatshrink" style="width:40%; height:auto;"> <img src="pictures_for_readme/y_wire_after_heatshrink.jpg" alt="Y-wire after heatshrink" style="width:32%; height:auto;">
+
+<img src="pictures_for_readme/schematic.png" alt="Schematic" style="width:100%; height:auto;">
+
+<img src="pictures_for_readme/wiring_1.jpg" alt="Wires cut to length and connectors fitted" style="width:44%; height:auto;"> <img src="pictures_for_readme/wiring_2.jpg" alt="Wiring completed" style="width:30%; height:auto;"> <img src="pictures_for_readme/12v_input.jpg" alt="12 V input socket with wires attached and heat-shrinked" style="width:12%; height:auto;">
+
+<img src="pictures_for_readme/12v_input_fitted.jpg" alt="12 V input socket fitted" style="width:27%; height:auto;"> <img src="pictures_for_readme/red_led_lit.jpg" alt="12 V plugged in, LED lit" style="width:36%; height:auto;"> <img src="pictures_for_readme/covers_fitted.jpg" alt="Covers fitted" style="width:32%; height:auto;">
 
 # Bring-Up
 Bring-up goes as follows:
