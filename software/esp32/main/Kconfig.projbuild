@@ -1,0 +1,45 @@
+menu "Application Configuration"
+
+    config PLINKY_PLONKY_UART_NUM
+        int "UART_NUM"
+        default 1
+        help
+            UART number to use for the stepper motor driver
+
+    config PLINKY_PLONKY_DEBUG_LED_PIN
+        int "Debug LED pin"
+        default 8
+        help
+            The pin where a debug LED is connected
+
+    config PLINKY_PLONKY_UART_TXD_PIN
+        int "TXD pin"
+        default 7
+        help
+            UART TX pin wired to the stepper motor driver
+
+    config PLINKY_PLONKY_UART_RXD_PIN
+        int "RXD pin"
+        default 6
+        help
+            UART RX pin wired to the stepper motor driver
+
+    config PLINKY_PLONKY_UART_BAUD_RATE
+        int "UART baud rate"
+        default 115200
+        help
+            Baud rate on the UART talking to the stepper motor driver
+
+    config PLINKY_PLONKY_ENABLE_PIN
+        int "stepper motor enable pin"
+        default 9
+        help
+            Pin connected to the TMC2209 EN pin
+
+    config PLINKY_PLONKY_DIAG_PIN
+        int "DIAG pin"
+        default 5
+        help
+            Pin connected to the TMC2209 DIAG pin
+
+endmenu

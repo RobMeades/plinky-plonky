@@ -82,5 +82,7 @@ Assembly goes as follows (see also pictures below):
 # Bring-Up
 Bring-up goes as follows:
 
-- plug a PC on which the [ESP-IDF software environment](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html) has been installed into the USB socket of the ESP32 board: a USB device should appear on the PC (e.g. `/dev/ttyACM0` on Linux).
+- plug a PC on which the [ESP-IDF software environment](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html) has been installed into the USB socket of the ESP32 board: a USB device should appear on the PC (e.g. `/dev/ttyACM0` on Linux); there is no need to plug 12&nbsp;V power into the plinky-plonky just yet as it should be able to draw sufficient power for these initial tests from the USB,
+- build the software and download it to the ESP32 via USB; if you have wired up different GPIO pins on the ESP32 to those in the schematic above, change the values in [Kconfig.projbuild](software/esp32/Kconfig.projbuild) before compiling.
+- restart the ESP32 with the
 
