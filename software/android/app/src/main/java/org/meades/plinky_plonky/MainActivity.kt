@@ -40,7 +40,6 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalHapticFeedback
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -383,7 +382,6 @@ class MainActivity : ComponentActivity() {
         var pendingAction by remember { mutableStateOf<String?>(null) } // "NEW" or a Sequence Name
         var showLoadMenu by remember { mutableStateOf(false) }
         var savedSequences by remember { mutableStateOf(getAllSavedNames(context)) }
-        var boxOffset by remember { mutableStateOf(IntOffset(0, 0)) }
         var curveTension by remember { mutableFloatStateOf(DEFAULT_TENSION) }
         val loadAction = { name: String ->
             val loaded = loadSequence(context, name)
@@ -409,7 +407,7 @@ class MainActivity : ComponentActivity() {
             // Reset the state flags
             onModifiedChange(false)
 
-            // Hide the dialoge
+            // Hide the dialog
             pendingAction = null
         }
 
@@ -421,7 +419,7 @@ class MainActivity : ComponentActivity() {
         }
 
         // Float version for Canvas
-        fun getUsableSize(totalSize: androidx.compose.ui.geometry.Size): Pair<Float, Float> {
+        fun getUsableSize(totalSize: Size): Pair<Float, Float> {
             val usableWidth = totalSize.width - (leftPaddingPx + edgePaddingPx)
             val usableHeight = totalSize.height - (edgePaddingPx + bottomBarHeightPx)
             return Pair(usableWidth, usableHeight)
@@ -445,7 +443,7 @@ class MainActivity : ComponentActivity() {
 
                     // ONLY send BLE update every BLE_UPDATE_INTERVAL_MS
                     if (now - lastWriteTime >= BLE_UPDATE_INTERVAL_MS) {
-                        val currentSpeed = calculateSpeedAtTime(playbackProgress, nodes, tension = curveTension)
+                        val currentSpeed = calculateSpeedAtTime(playbackProgress, nodes)
                         onSpeedUpdate((currentSpeed * 1000).toInt())
                         lastWriteTime = now
                     }
@@ -622,7 +620,7 @@ class MainActivity : ComponentActivity() {
                     val speedVal = 2.0f - (i * 0.5f)
                     drawText(
                         textMeasurer = textMeasurer,
-                        text = "${speedVal} Hz",
+                        text = "$speedVal Hz",
                         topLeft = Offset(5.dp.toPx(), y - 10.dp.toPx()),
                         style = TextStyle(color = Color.Gray, fontSize = 10.sp)
                     )
@@ -727,7 +725,7 @@ class MainActivity : ComponentActivity() {
                     savedSequences = getAllSavedNames(context) // Refresh list
                     showLoadMenu = true
                 }) {
-                    Icon(androidx.compose.material.icons.Icons.AutoMirrored.Filled.List, "Load", tint = Color.White)
+                    Icon(Icons.AutoMirrored.Filled.List, "Load", tint = Color.White)
                 }
 
                 // DROPDOWN MENU
@@ -760,7 +758,7 @@ class MainActivity : ComponentActivity() {
                                         modifier = Modifier.size(24.dp)
                                     ) {
                                         Icon(
-                                            imageVector = androidx.compose.material.icons.Icons.Default.Close,
+                                            imageVector = Icons.Default.Close,
                                             contentDescription = "Delete",
                                             tint = Color.Red.copy(alpha = 0.6f),
                                             modifier = Modifier.size(16.dp)
@@ -797,7 +795,7 @@ class MainActivity : ComponentActivity() {
             if (showSaveDialog) {
                 // Pre-fill the input with the current name if it exists
                 if (saveNameInput.isEmpty() && currentSequenceName != null) {
-                    saveNameInput = currentSequenceName!!
+                    saveNameInput = currentSequenceName
                 }
 
                 AlertDialog(
@@ -967,7 +965,7 @@ class MainActivity : ComponentActivity() {
                             Column(modifier = Modifier.weight(1f)) {
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                     Text("TENSION", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
-                                    val label = if (curveTension > 8f) "Sharp" else if (curveTension < 1.8f) "Loose" else "Smooth"
+                                    val label = if (curveTension > SHARP_TENSION) "Sharp" else if (curveTension < SMOOTH_TENSION) "Loose" else "Smooth"
                                     Text(label, color = Color.Magenta, fontSize = 12.sp)
                                 }
                                 Slider(
@@ -987,9 +985,25 @@ class MainActivity : ComponentActivity() {
                         }
                     } else {
                         // PLAYBACK MODE: Telemetry (Centered)
-                        val currentSpeedHz = calculateSpeedAtTime(playbackProgress, nodes, tension = curveTension)
-                        Row(modifier = Modifier.weight(1f), horizontalArrangement = Arrangement.SpaceEvenly) {
-                            // ... (Keep existing Telemetry Text columns here)
+                        val currentSpeedHz = calculateSpeedAtTime(playbackProgress, nodes)
+                        Row(modifier = Modifier.weight(1f), horizontalArrangement = Arrangement.SpaceEvenly)  {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("CURRENT SPEED", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+                                Text(
+                                    text = String.format(Locale.getDefault(), "%.2f Hz", currentSpeedHz),
+                                    color = Color.Yellow,
+                                    style = MaterialTheme.typography.titleLarge
+                                )
+                            }
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("PROGRESS", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+                                Text(
+                                    text = String.format(Locale.getDefault(), "%.1fs / %ds",
+                                        playbackProgress * durationSeconds, durationSeconds.toInt()),
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.titleLarge
+                                )
+                            }
                         }
                     }
 
@@ -1015,7 +1029,7 @@ class MainActivity : ComponentActivity() {
 
         // State
         var knobValue by remember { mutableFloatStateOf(currentSpeed / 1000f) }
-        val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
+        val haptics = LocalHapticFeedback.current
 
         // Hardware sync
         LaunchedEffect(currentSpeed) {
@@ -1191,7 +1205,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun calculateSpeedAtTime(timePercent: Float, nodes: List<AutomationNode>, tension: Float = DEFAULT_TENSION): Float {
+    fun calculateSpeedAtTime(timePercent: Float, nodes: List<AutomationNode>): Float {
         if (nodes.isEmpty()) return 1f
         if (timePercent <= nodes.first().timePercent) return nodes.first().speed
         if (timePercent >= nodes.last().timePercent) return nodes.last().speed
@@ -1199,19 +1213,17 @@ class MainActivity : ComponentActivity() {
         for (i in 0 until nodes.size - 1) {
             val p0 = nodes[i]
             val p1 = nodes[i + 1]
+
             if (timePercent >= p0.timePercent && timePercent <= p1.timePercent) {
-                // Cubic Bezier interpolation (t is 0 to 1 between these two nodes)
+                // Calculate 't' (0.0 to 1.0) for this specific segment
                 val t = (timePercent - p0.timePercent) / (p1.timePercent - p0.timePercent)
 
-                // This math mimics the 'distance' logic in your draw function
-                val m1 = 1f / tension
-                val m2 = 1f - (1f / tension)
-
-                // Simplified Cubic Bezier formula for Y (Speed)
-                // Using control points with same Y as p0 and p1 respectively
-                val speed = (1-t).pow(3) * p0.speed +
-                        3 * (1-t).pow(2) * t * p0.speed + // Control Point 1 Y
-                        3 * (1-t) * t.pow(2) * p1.speed + // Control Point 2 Y
+                // Full Cubic Bezier Formula
+                // Points: P0 (node), P1 (control 1), P2 (control 2), P3 (node)
+                // We only care about the Y (speed) component here
+                val speed = (1 - t).pow(3) * p0.speed +
+                        3 * (1 - t).pow(2) * t * p0.speed + // Control Point 1 Y
+                        3 * (1 - t) * t.pow(2) * p1.speed + // Control Point 2 Y
                         t.pow(3) * p1.speed
 
                 return speed
@@ -1267,7 +1279,7 @@ fun RotaryKnob(
     value: Float,
     onValueChange: (Float) -> Unit
 ) {
-    val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
+    val haptics = LocalHapticFeedback.current
     val updatedOnValueChange by rememberUpdatedState(onValueChange)
 
     // This tracks the value locally so we don't rely on the slow state-update loop
