@@ -43,7 +43,10 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import android.content.res.Configuration
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
@@ -58,9 +61,12 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.snapshots.SnapshotStateList
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -97,7 +103,9 @@ class MainActivity : ComponentActivity() {
 
     var isPlaying by mutableStateOf(false)
     var currentSpeed by mutableIntStateOf(0)
-    var nodes by mutableStateOf(listOf(AutomationNode(0f, 1f), AutomationNode(1f, 1f)))
+    // We use 'val' because the List Object (the buffer) never changes, only its contents.
+    // We remove 'by' so we can access the .clear() and .addAll() methods directly.
+    val nodes = mutableStateListOf(AutomationNode(0f, 1f), AutomationNode(1f, 1f))
     var durationSeconds by mutableFloatStateOf(DEFAULT_DURATION)
     var currentSequenceName by mutableStateOf<String?>(null)
     var isModified by mutableStateOf(false)
@@ -295,7 +303,9 @@ class MainActivity : ComponentActivity() {
                     },
                     onSpeedUpdate = { writeInt32(SPEED_UUID, it) },
                     nodes = nodes, // Pass the current value
-                    onNodesChange = { nodes = it }, // When the UI wants to change it, update the Activity variable
+                    onNodesChange = { newNodes ->
+                        nodes.clear()
+                        nodes.addAll(newNodes) }, // When the UI wants to change it, update the Activity variable
                     durationSeconds = durationSeconds,
                     onDurationChange = { durationSeconds = it },
                     currentSequenceName = currentSequenceName,
@@ -369,7 +379,7 @@ class MainActivity : ComponentActivity() {
         isPlaying: Boolean,
         onTogglePlay: (Boolean) -> Unit,
         onSpeedUpdate: (Int) -> Unit,
-        nodes: List<AutomationNode>,
+        nodes: SnapshotStateList<AutomationNode>,
         onNodesChange: (List<AutomationNode>) -> Unit,
         durationSeconds: Float,
         onDurationChange: (Float) -> Unit,
@@ -386,15 +396,16 @@ class MainActivity : ComponentActivity() {
         val density = LocalDensity.current
         val edgePaddingPx = remember(density) { with(density) { 24.dp.toPx() } }
         val leftPaddingPx = remember(density) { with(density) { 60.dp.toPx() } }
+        val rightPaddingPx = leftPaddingPx
         val bottomBarHeightDp = if (isPlaying) 60.dp else 100.dp
         val bottomBarHeightPx = with(density) { bottomBarHeightDp.toPx() }
+        var zoomFactor by remember { mutableFloatStateOf(1f) }
+        var panOffset by remember { mutableFloatStateOf(0f) }
+        val automationPath = remember { Path() }
 
         var draggedNodeIndex by remember { mutableIntStateOf(-1) }
         var playbackProgress by remember { mutableFloatStateOf(0f) }
         var lastSelectedIndex by remember { mutableIntStateOf(-1) }
-        // This ensures our gestures always see the LATEST nodes list
-        // even if the pointerInput block hasn't restarted.
-        val latestNodes by rememberUpdatedState(nodes)
 
         var showSaveDialog by remember { mutableStateOf(false) }
         var saveNameInput by remember { mutableStateOf("") }
@@ -407,7 +418,8 @@ class MainActivity : ComponentActivity() {
         val loadAction = { name: String ->
             val loaded = loadSequence(context, name)
             if (loaded != null) {
-                onNodesChange(loaded.first)
+                nodes.clear()
+                nodes.addAll(loaded.first)
                 onOriginalNodesChange(loaded.first.toList()) // Update the backup
                 onDurationChange(loaded.second)
                 onOriginalDurationChange(loaded.second)
@@ -419,7 +431,8 @@ class MainActivity : ComponentActivity() {
         val resetToNew = {
             // Reset the graph data
             val defaultNodes = listOf(AutomationNode(0f, 1f), AutomationNode(1f, 1f))
-            onNodesChange(defaultNodes)
+            nodes.clear()
+            nodes.addAll(defaultNodes)
             onOriginalNodesChange(defaultNodes) // Set the new "baseline" to the default
             onNameChange(null)
             onDurationChange(DEFAULT_DURATION)
@@ -432,44 +445,49 @@ class MainActivity : ComponentActivity() {
             pendingAction = null
         }
 
-        fun getUsableSize(totalSize: androidx.compose.ui.unit.IntSize): Pair<Float, Float> {
-            val usableWidth = totalSize.width - (leftPaddingPx + edgePaddingPx)
-            // Usable height starts at edgePaddingPx and ends at totalSize.height - bottomBarHeightPx
+        fun getUsableSize(totalSize: androidx.compose.ui.unit.IntSize, zoom: Float = 1f): Pair<Float, Float> {
+            val baseWidth = totalSize.width - (leftPaddingPx + rightPaddingPx)
+            val zoomedWidth = baseWidth * zoom
             val usableHeight = totalSize.height - (edgePaddingPx + bottomBarHeightPx)
-            return Pair(usableWidth, usableHeight)
+            return Pair(zoomedWidth, usableHeight)
         }
 
         // Float version for Canvas
-        fun getUsableSize(totalSize: Size): Pair<Float, Float> {
-            val usableWidth = totalSize.width - (leftPaddingPx + edgePaddingPx)
+        fun getUsableSize(totalSize: Size, zoom: Float = 1f): Pair<Float, Float> {
+            val baseWidth = totalSize.width - (leftPaddingPx + rightPaddingPx)
+            val zoomedWidth = baseWidth * zoom
             val usableHeight = totalSize.height - (edgePaddingPx + bottomBarHeightPx)
-            return Pair(usableWidth, usableHeight)
+            return Pair(zoomedWidth, usableHeight)
         }
 
         // Playback engine
         LaunchedEffect(isPlaying) {
             if (isPlaying) {
-                val startTime = System.currentTimeMillis()
-                var lastWriteTime = 0L // Track when we last sent a BLE message
+                var lastFrameTime = System.currentTimeMillis()
+                var currentProgress = 0f
 
                 while (isPlaying) {
                     val now = System.currentTimeMillis()
-                    val elapsed = (now - startTime) / 1000f
-                    playbackProgress = (elapsed / durationSeconds).coerceIn(0f, 1f)
+                    val deltaTime = (now - lastFrameTime) / 1000f
+                    lastFrameTime = now
+
+                    // PROGRESS ADVANCES SLOWER WHEN ZOOMED IN
+                    // (e.g., if zoomFactor is 2.0, delta is halved)
+                    val progressDelta = (deltaTime / durationSeconds) / zoomFactor
+                    currentProgress += progressDelta
+                    playbackProgress = currentProgress.coerceIn(0f, 1f)
 
                     if (playbackProgress >= 1f) {
                         onTogglePlay(false)
                         break
                     }
 
-                    // ONLY send BLE update every BLE_UPDATE_INTERVAL_MS
-                    if (now - lastWriteTime >= BLE_UPDATE_INTERVAL_MS) {
-                        val currentSpeed = calculateSpeedAtTime(playbackProgress, nodes)
-                        onSpeedUpdate((currentSpeed * 1000).toInt())
-                        lastWriteTime = now
-                    }
+                    // MOTOR FREQUENCY IS SCALED BY ZOOM
+                    val baseSpeed = calculateSpeedAtTime(playbackProgress, nodes)
+                    val actualSpeed = baseSpeed / zoomFactor
+                    onSpeedUpdate((actualSpeed * 1000).toInt())
 
-                    delay(16) // Keep the UI/Cursor smooth at ~60fps
+                    delay(16)
                 }
             } else {
                 playbackProgress = 0f
@@ -482,149 +500,183 @@ class MainActivity : ComponentActivity() {
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color(0xFF0A0A0A))
-                .pointerInput(isPlaying) {
-                    coroutineScope {
-                        // 1. Taps and Double Taps
-                        launch {
-                            detectTapGestures(
-                                onTap = { offset ->
-                                    val (usableWidth, usableHeight) = getUsableSize(size)
-                                    // Use latestNodes to find hit
-                                    lastSelectedIndex = latestNodes.indexOfFirst {
-                                        val nodeX = leftPaddingPx + (it.timePercent * usableWidth)
-                                        val nodeY = edgePaddingPx + (1f - (it.speed / 2f)) * usableHeight
-                                        val dx = nodeX - offset.x
-                                        val dy = nodeY - offset.y
-                                        (dx * dx + dy * dy) < 3600f
-                                    }
-                                    if (lastSelectedIndex != -1) {
-                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    }
-                                },
-                                onDoubleTap = { offset ->
-                                    val (usableWidth, usableHeight) = getUsableSize(size)
-                                    val hitIndex = latestNodes.indexOfFirst {
-                                        val nodeX = leftPaddingPx + (it.timePercent * usableWidth)
-                                        val nodeY = edgePaddingPx + (1f - (it.speed / 2f)) * usableHeight
-                                        val dx = nodeX - offset.x
-                                        val dy = nodeY - offset.y
-                                        (dx * dx + dy * dy) < 3600f
-                                    }
+        )  {
+            val textMeasurer = rememberTextMeasurer()
+            Canvas(modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(Unit) {
+                        var lastTapTime = 0L
+                        val touchSlop = viewConfiguration.touchSlop // Standard distance before panning starts
 
-                                    if (hitIndex != -1) {
-                                        if (hitIndex != 0 && hitIndex != latestNodes.size - 1) {
-                                            val newList = latestNodes.toMutableList().apply { removeAt(hitIndex) }
-                                            onNodesChange(newList)
-                                            lastSelectedIndex = -1
-                                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        }
-                                    } else {
-                                        val t = ((offset.x - leftPaddingPx) / usableWidth).coerceIn(0f, 1f)
-                                        var s = (1f - ((offset.y - edgePaddingPx) / usableHeight)).coerceIn(0f, 1f) * 2f
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val currentTime = System.currentTimeMillis()
+                            var currentSize = getUsableSize(size, zoomFactor)
 
-                                       // Snap to the frequency of the node to the left of this new one
-                                        val previousNode = latestNodes.lastOrNull { it.timePercent < t }
-                                        if (previousNode != null) {
-                                            val snapThreshold = 0.1f // Adjust this for "stickiness"
-                                            if (kotlin.math.abs(s - previousNode.speed) < snapThreshold) {
-                                                s = previousNode.speed
-                                                // Trigger a light haptic to confirm the "snap"
-                                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                            }
-                                        }
+                            // 1. Hit Test
+                            val hitIndex = nodes.indexOfFirst {
+                                val nodeX = leftPaddingPx - panOffset + (it.timePercent * currentSize.first)
+                                val nodeY = edgePaddingPx + (1f - (it.speed / 2f)) * currentSize.second
+                                val dx = nodeX - down.position.x
+                                val dy = nodeY - down.position.y
+                                (dx * dx + dy * dy) < 10000f
+                            }
+                            if (hitIndex != -1) { lastSelectedIndex = hitIndex }
 
-                                        val newNode = AutomationNode(t, s)
-                                        val newList = (latestNodes + newNode).sortedBy { it.timePercent }
-                                        onNodesChange(newList)
-                                        lastSelectedIndex = newList.indexOf(newNode)
-                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                            // 2. Decision Engine
+                            var isZooming = false
+                            var isPanning = false
+                            var upEvent: PointerInputChange? = null
+
+                            // If we touched the node that's already yellow, we don't want to wait!
+                            val isInstantDrag = hitIndex != -1 && hitIndex == lastSelectedIndex
+
+                            val isLongPress = if (isInstantDrag) {
+                                false // We don't need the timer for an instant drag
+                            } else {
+                                withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        if (event.changes.size > 1) { isZooming = true; break }
+                                        val change = event.changes.firstOrNull { it.id == down.id }
+                                        if (change == null || !change.pressed) { upEvent = change; break }
+
+                                        val totalDrag = (change.position - down.position).getDistance()
+                                        if (hitIndex == -1 && totalDrag > touchSlop) { isPanning = true; break }
+                                        if (hitIndex != -1 && totalDrag > touchSlop * 5) { isPanning = true; break }
+
+                                        event.changes.forEach { it.consume() }
                                     }
-                                    onModifiedChange(true)
+                                } == null && !isZooming && !isPanning
+                            }
+
+                            // 3. Execution
+                            if (isZooming) {
+                                // --- ZOOM LOOP ---
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val activeChanges = event.changes.filter { it.pressed }
+                                    if (activeChanges.size < 2) break
+                                    val zoomChange = event.calculateZoom()
+                                    val panChange = event.calculatePan()
+                                    if (zoomChange != 1f || panChange != Offset.Zero) {
+                                        zoomFactor = (zoomFactor * zoomChange).coerceIn(1f, 5f)
+                                        zoomFactor *= (1f + (zoomChange - 1f) * 0.5f)
+                                        val (zoomedW, _) = getUsableSize(size, zoomFactor)
+                                        val maxScroll = (zoomedW - getUsableSize(size, 1f).first).coerceAtLeast(0f)
+                                        panOffset = (panOffset - panChange.x).coerceIn(0f, maxScroll)
+                                        event.changes.forEach { it.consume() }
+                                    }
                                 }
-                            )
-                        }
+                            } else if (isPanning) {
+                                // --- SINGLE FINGER PAN LOOP ---
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull { it.id == down.id }
+                                    if (change == null || !change.pressed) break
 
-                        // 2. Drag Logic
-                        launch {
-                            detectDragGestures(
-                                onDragStart = { offset ->
-                                    val (usableWidth, usableHeight) = getUsableSize(size)
-                                    // CRITICAL: Use latestNodes here so we don't pick a stale index
-                                    draggedNodeIndex = latestNodes.indexOfFirst {
-                                        val nodeX = leftPaddingPx + (it.timePercent * usableWidth)
-                                        val nodeY = edgePaddingPx + (1f - (it.speed / 2f)) * usableHeight
-                                        val dx = nodeX - offset.x
-                                        val dy = nodeY - offset.y
-                                        (dx * dx + dy * dy) < 10000f // 100px hit area for drag
-                                    }
-                                    if (draggedNodeIndex != -1) {
-                                        lastSelectedIndex = draggedNodeIndex
-                                        // This gives a satisfying "click" when you grab a node
-                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    }
-                                },
-                                onDrag = { change, _ ->
-                                    if (draggedNodeIndex != -1) {
-                                        change.consume()
-                                        val (usableWidth, usableHeight) = getUsableSize(size)
+                                    val panChange = change.position.x - change.previousPosition.x
+                                    val (zoomedW, _) = getUsableSize(size, zoomFactor)
+                                    val maxScroll = (zoomedW - getUsableSize(size, 1f).first).coerceAtLeast(0f)
 
-                                        val rawT = ((change.position.x - leftPaddingPx) / usableWidth).coerceIn(0f, 1f)
-                                        val newS = (1f - ((change.position.y - edgePaddingPx) / usableHeight)).coerceIn(0f, 1f) * 2f
+                                    panOffset = (panOffset - panChange).coerceIn(0f, maxScroll)
+                                    change.consume()
+                                }
+                            } else if ((isLongPress || isInstantDrag) && hitIndex != -1) {
+                                // --- STABLE DRAG NODE LOOP ---
+                                draggedNodeIndex = hitIndex
+                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
 
-                                        // Use latestNodes for boundary checking
-                                        val minT = if (draggedNodeIndex > 0) latestNodes[draggedNodeIndex - 1].timePercent + 0.005f else 0f
-                                        val maxT = if (draggedNodeIndex < latestNodes.size - 1) latestNodes[draggedNodeIndex + 1].timePercent - 0.005f else 1f
+                                var hasMovedPastSlop = false
+                                val dragSlopPx = 15f // Adjust this: higher = more "sticky", lower = more "sensitive"
 
-                                        if (draggedNodeIndex != 0 && draggedNodeIndex != latestNodes.size - 1) {
-                                            if ((rawT <= minT && latestNodes[draggedNodeIndex].timePercent > minT) ||
-                                                (rawT >= maxT && latestNodes[draggedNodeIndex].timePercent < maxT)) {
-                                                // We just "thudded" into a neighbor
-                                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                            }
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val dragChange = event.changes.firstOrNull { it.id == down.id }
+                                    if (dragChange == null || !dragChange.pressed) break
+
+                                    dragChange.consume()
+
+                                    // Only start moving the node if the finger has moved enough
+                                    if (!hasMovedPastSlop) {
+                                        val distanceFromStart = (dragChange.position - down.position).getDistance()
+                                        if (distanceFromStart > dragSlopPx) {
+                                            hasMovedPastSlop = true
                                         }
+                                    }
+
+                                    if (hasMovedPastSlop) {
+                                        val (uW, uH) = getUsableSize(size, zoomFactor)
+
+                                        val rawT = ((dragChange.position.x + panOffset - leftPaddingPx) / uW).coerceIn(0f, 1f)
+                                        val newS = (1f - ((dragChange.position.y - edgePaddingPx) / uH)).coerceIn(0f, 1f) * 2f
+
+                                        // --- Your Snap/Boundary Math ---
+                                        val minT = if (draggedNodeIndex > 0) nodes[draggedNodeIndex - 1].timePercent + 0.005f else 0f
+                                        val maxT = if (draggedNodeIndex < nodes.size - 1) nodes[draggedNodeIndex + 1].timePercent - 0.005f else 1f
 
                                         val finalT = when (draggedNodeIndex) {
                                             0 -> 0f
-                                            latestNodes.size - 1 -> 1f
+                                            nodes.size - 1 -> 1f
                                             else -> rawT.coerceIn(minT, maxT)
                                         }
 
-                                        val updated = latestNodes.toMutableList()
                                         var finalS = newS
-
-                                        // Snap to neighbor speed
                                         val snapThreshold = 0.08f
-                                        val prevNode = if (draggedNodeIndex > 0) latestNodes[draggedNodeIndex - 1] else null
-                                        val nextNode = if (draggedNodeIndex < latestNodes.size - 1) latestNodes[draggedNodeIndex + 1] else null
+                                        val prevNode = if (draggedNodeIndex > 0) nodes[draggedNodeIndex - 1] else null
+                                        val nextNode = if (draggedNodeIndex < nodes.size - 1) nodes[draggedNodeIndex + 1] else null
+                                        if (prevNode != null && kotlin.math.abs(finalS - prevNode.speed) < snapThreshold) finalS = prevNode.speed
+                                        else if (nextNode != null && kotlin.math.abs(finalS - nextNode.speed) < snapThreshold) finalS = nextNode.speed
 
-                                        // If close to left neighbor's speed, snap it
-                                        if (prevNode != null && kotlin.math.abs(finalS - prevNode.speed) < snapThreshold) {
-                                            finalS = prevNode.speed
-                                        }
-                                        // Or if close to right neighbor's speed, snap it
-                                        else if (nextNode != null && kotlin.math.abs(finalS - nextNode.speed) < snapThreshold) {
-                                            finalS = nextNode.speed
-                                        }
-
-                                        updated[draggedNodeIndex] = AutomationNode(finalT, finalS)
-                                        onNodesChange(updated)
+                                        nodes[draggedNodeIndex] = AutomationNode(finalT, finalS)
                                     }
-                                },
-                                onDragEnd = {
-                                    draggedNodeIndex = -1
-                                    onModifiedChange(true)
-                                },
-                                onDragCancel = {
-                                    draggedNodeIndex = -1
                                 }
-                            )
+                                draggedNodeIndex = -1
+                                onModifiedChange(true)
+                            } else if (upEvent != null) {
+                                // --- TAP / DOUBLE TAP ---
+                                    val up = upEvent!!
+                                    val isDoubleTap = (currentTime - lastTapTime) < viewConfiguration.doubleTapTimeoutMillis
+
+                                    if (isDoubleTap) {
+                                        val (uW, uH) = getUsableSize(size, zoomFactor)
+                                        if (hitIndex != -1) {
+                                            // Delete node (except ends)
+                                            if (hitIndex != 0 && hitIndex != nodes.size - 1) {
+                                                val newList = nodes.toMutableList().apply { removeAt(hitIndex) }
+                                                onNodesChange(newList)
+                                                lastSelectedIndex = -1
+                                            }
+                                        } else {
+                                            // Create node
+                                            val t = ((up.position.x + panOffset - leftPaddingPx) / uW).coerceIn(0f, 1f)
+                                            val s = (1f - ((up.position.y - edgePaddingPx) / uH)).coerceIn(0f, 1f) * 2f
+
+                                            // Create-time speed snapping
+                                            var finalS = s
+                                            val previousNode = nodes.lastOrNull { it.timePercent < t }
+                                            if (previousNode != null && kotlin.math.abs(s - previousNode.speed) < 0.1f) {
+                                                finalS = previousNode.speed
+                                            }
+
+                                            val newNode = AutomationNode(t, finalS)
+                                            val newList = (nodes + newNode).sortedBy { it.timePercent }
+                                            onNodesChange(newList)
+                                            lastSelectedIndex = newList.indexOf(newNode)
+                                        }
+                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        onModifiedChange(true)
+                                        lastTapTime = 0L // Reset
+                                    } else {
+                                        // Single Tap selection
+                                        if (hitIndex != -1) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        lastTapTime = currentTime
+                                    }
+                                }
+                            }
                         }
-                    }
-                }
-        )  {
-            val textMeasurer = rememberTextMeasurer()
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                val (usableWidth, usableHeight) = getUsableSize(size)
+                ) {
+                var (usableWidth, usableHeight) = getUsableSize(size, zoomFactor)
                 val gridColor = Color.White.copy(alpha = 0.15f) // Subtle but visible
 
                 // 2. DRAW HORIZONTAL GRID (Speed)
@@ -632,8 +684,8 @@ class MainActivity : ComponentActivity() {
                     val y = edgePaddingPx + (usableHeight * (i / 4f))
                     drawLine(
                         color = gridColor,
-                        start = Offset(leftPaddingPx, y),
-                        end = Offset(leftPaddingPx + usableWidth, y),
+                        start = Offset(leftPaddingPx - panOffset, y),
+                        end = Offset(leftPaddingPx - panOffset + usableWidth, y),
                         strokeWidth = 1.dp.toPx()
                     )
 
@@ -652,7 +704,7 @@ class MainActivity : ComponentActivity() {
                 val numVerticalLines = (durationSeconds / secondsPerLine).toInt()
                 for (i in 0..numVerticalLines) {
                     val time = i * secondsPerLine
-                    val x = leftPaddingPx + (time / durationSeconds) * usableWidth
+                    val x = leftPaddingPx - panOffset + (time / durationSeconds * usableWidth)
 
                     drawLine(
                         color = gridColor,
@@ -663,13 +715,13 @@ class MainActivity : ComponentActivity() {
                 }
 
                 // 4. DRAW BEZIER & NODES (Must come AFTER grid to be on top)
-                drawBezierPath(nodes, Color.Cyan, edgePaddingPx, leftPaddingPx, usableWidth, usableHeight, tension = curveTension)
+                drawBezierPath(automationPath, nodes, Color.Cyan, edgePaddingPx, leftPaddingPx, rightPaddingPx, panOffset,usableWidth, usableHeight, tension = curveTension)
 
                 // Draw Nodes
-                nodes.forEachIndexed { index, nodes ->
+                nodes.forEachIndexed { index, _nodes ->
                     // USE THE USABLE DIMENSIONS HERE
-                    val centerX = leftPaddingPx + ( nodes.timePercent * usableWidth)
-                    val centerY = edgePaddingPx + (1f - (nodes.speed / 2f)) * usableHeight
+                    val centerX = leftPaddingPx - panOffset + (_nodes.timePercent * usableWidth)
+                    val centerY = edgePaddingPx + (1f - (_nodes.speed / 2f)) * usableHeight
 
                     val isDragging = index == draggedNodeIndex
                     val isLastSelected = index == lastSelectedIndex
@@ -705,10 +757,10 @@ class MainActivity : ComponentActivity() {
                     }
 
                     if (index == lastSelectedIndex || index == draggedNodeIndex) {
-                        val timeValue = nodes.timePercent * durationSeconds
-                        val label = String.format(Locale.getDefault(), "%.1fs, %.2fHz", timeValue, nodes.speed)
+                        val timeValue = _nodes.timePercent * durationSeconds
+                        val label = String.format(Locale.getDefault(), "%.1fs, %.2fHz", timeValue, _nodes.speed)
 
-                        val horizontalOffset = if (centerX < 1500f) 150f else -350f
+                        val horizontalOffset = if (centerX < size.width / 2) 150f else -350f
                         val verticalOffset = if (centerY < 150f) 60f else -100f
 
                         drawText(
@@ -726,8 +778,8 @@ class MainActivity : ComponentActivity() {
 
                 // Playback Cursor
                 if (isPlaying) {
-                    // FIX: Offset the cursor by the same padding the nodes use
-                    val cursorX = leftPaddingPx + (playbackProgress * usableWidth)
+                    // Offset the cursor by the same padding the nodes use
+                    val cursorX = leftPaddingPx - panOffset + (playbackProgress * usableWidth)
                     drawLine(
                         color = Color.Yellow,
                         start = Offset(cursorX, edgePaddingPx),
@@ -1412,20 +1464,23 @@ fun RotaryKnob(
 }
 
 fun DrawScope.drawBezierPath(
+    path: Path,
     nodes: List<AutomationNode>,
     color: Color,
     padding: Float,
     leftPadding: Float,
+    rightPadding: Float,
+    panOffset: Float,
     uWidth: Float,
     uHeight: Float,
     tension: Float = DEFAULT_TENSION
 ) {
     if (nodes.size < 2) return
-    val path = androidx.compose.ui.graphics.Path()
+    path.reset()
 
     fun getCoord(node: AutomationNode): Offset {
         return Offset(
-            leftPadding + (node.timePercent * uWidth),
+            leftPadding - panOffset + (node.timePercent * uWidth),
             padding + (1f - (node.speed / 2f)) * uHeight
         )
     }
