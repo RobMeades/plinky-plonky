@@ -9,7 +9,7 @@ In order to make this motorised plinky-plonky you will need to be able to:
 - solder,
 - wire-up a small amount of electronics,
 - write, or at least compile, C code (based on [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html) for the ESP32),
-- write a simple Android application to drive the Android Bluetooth Classic Serial Port Protocol (SPP) API.
+- write, or at least compile, an Android application to drive the Android Bluetooth API, or download the rather spiffy one from the [Releases](https://github.com/RobMeades/plinky-plonky/releases) section of this repo that Google Gemini wrote with a lot of prompting.
 
 You will need the following tools:
 
@@ -87,7 +87,13 @@ Assembly goes as follows (see also pictures below):
 # Bring-Up
 Bring-up goes as follows:
 - plug a PC on which the [ESP-IDF software environment](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html) has been installed into the USB socket of the ESP32 board: a USB device should appear on the PC (e.g. `/dev/ttyACM0` on Linux); there is no need to plug 12&nbsp;V power into the plinky-plonky just yet as it should be able to draw sufficient power for these initial tests from the USB,
-- build the software and download it to the ESP32 via USB; if you have wired up different GPIO pins on the ESP32 to those in the schematic above, change the values in [Kconfig.projbuild](software/esp32/Kconfig.projbuild) before compiling;
-- when the code runs on the ESP32 nothing much should happen, you will need an Android application for that, but if you see a splurge of "STALL" in the logged output of the ESP32 then you _do_ need to plug 12&nbsp;V power into the plinky-plonky.
-- 
+- build the software that is contained in the [software/esp32](/software/esp32) directory and download it to the ESP32 via USB; if you have wired up different GPIO pins on the ESP32 to those in the schematic above, change the values in [Kconfig.projbuild](/software/esp32/main/Kconfig.projbuild) before compiling,
+- when the code runs on the ESP32 nothing much should happen, you will need an Android application for that, but if you see a splurge of "STALL" in the logged output of the ESP32 then you _do_ need to plug 12&nbsp;V power into the plinky-plonky,
+- either install the pre-built Android `.apk` from the [Releases](https://github.com/RobMeades/plinky-plonky/releases) section of this repository on an Android phone or, if you wish to build/modify the application yourself, follow the instructions in the [software/android](/software/android) directory; Android will show a `Play Protect` warning, which is normal for independent, open-source project: to install, tap `More Details` and then `Install Anyway`,
+- make sure you have Bluetooth switch on on the Android phone, hold the phone upright (portait orientatoin) and you should be able to launch the application,
+- give the applicatoin the permissions it asks for and use it to connect to the Plinky-Plonky,
+- press `Play` to have the motor run, `Stop` to stop it, adjust the speed using the knob or turn the phone landscape to generate complicated/ramped speed patterns.
 
+If you find that the Plinky-Plonky rattles at a certain speed, even if you've used the bearing approach above, that will be because the handle can be very slightly loose in the bearing: should that be the case, drop a _very_ tiny amount of glue between the handle and the bearing to stick it in place, being extremely careful not to get any glue on the runners of the bearing.
+
+ 

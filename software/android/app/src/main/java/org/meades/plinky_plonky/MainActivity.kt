@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
-/* This written by Google Gemini from my prompts. */
+/* This written by Google Gemini from my prompts, over several days
+ * with several arguments/disagreements and not a few regressions
+ * and "imaginative" outcomes along the way.  It still emits warnings
+ * but I dare not touch it: good enough is good enough. */
 
 package org.meades.plinky_plonky
 
@@ -63,7 +66,6 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.lifecycle.lifecycleScope
@@ -85,8 +87,6 @@ const val MAX_TENSION = 12f
 const val DEFAULT_DURATION = 30f
 const val MIN_DURATION = 5f
 const val MAX_DURATION = 60f
-
-const val BLE_UPDATE_INTERVAL_MS = 50L
 
 // UUIDs
 val SERVICE_UUID: UUID = UUID.fromString("0000FFE0-0000-1000-8000-00805F9B34FB")
