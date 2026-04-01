@@ -50,8 +50,8 @@
 
 // From the table in section 14 of the TMC2209 datasheet,
 // the number to multiply VACTUAL by to get a step frequency
-// in milliHertz
-#define VACTUAL_TO_MILLIHERTZ 715
+// in microHertz
+#define VACTUAL_TO_MICROHERTZ (715 * 1000 / 256 / 2)
 
 // The maximum value of IRUN or IHOLD, which are 5-bit values.
 #define IRUN_OR_IHOLD_MAX 31
@@ -682,7 +682,8 @@ esp_err_t tmc2209_unset_current(int32_t address)
 esp_err_t tmc2209_set_velocity(int32_t address,
                                int32_t milliHertz)
 {
-    milliHertz /= VACTUAL_TO_MILLIHERTZ;
+    milliHertz *= 1000;
+    milliHertz /= VACTUAL_TO_MICROHERTZ;
 
     // Write to the VACTUAL register (0x22)
     esp_err_t err = write_reg(address, 0x22, milliHertz);

@@ -239,10 +239,11 @@ esp_err_t tmc2209_unset_current(int32_t address);
  * Note: for operation at low speeds you might want to
  * look at tmc2209_set_stealth_chop_threshold().
  *
- * Note: not sure if this function is really useful,left
- * here for backwards compatibility but everything in
- * stepper land is really done in terms of time and so
- * TSTEP becomes the more natural unit, see
+ * Note: this is the velocity at a microstep resolution
+ * of 1: if you have set a greater microstep resolution
+ * (e.g. 256) then, to get the specified rotation rate
+ * in milliHertz you must multiply the requested velocity
+ * by the microstep resolution.
  *
  * @param address    the address of the device, range 0 to 3.
  * @param milliHertz the step rate in millihertz, i.e.
@@ -256,6 +257,12 @@ esp_err_t tmc2209_set_velocity(int32_t address,
 
 /** Get the velocity of the stepper motor attached to a
  * TMC2209 device.
+ *
+ * Note: this returns the velocity at a microstep resolution
+ * of 1: if you have set a greater microstep resolution
+ * (e.g. 256) then, to get the specified rotation rate
+ * in milliHertz you must divide the velocity by the
+ * microstep resolution.
  *
  * @param address    the address of the device, range 0 to 3.
  * @param milliHertz a place to put the step rate in millihertz;
