@@ -1,3 +1,21 @@
+/*
+ * Copyright 2026 Rob Meades
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* This written by Google Gemini from my prompts. */
+
 package org.meades.plinky_plonky
 
 import android.annotation.SuppressLint
@@ -41,6 +59,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -252,23 +271,25 @@ class MainActivity : ComponentActivity() {
                 LandscapeSequencer(
                     isPlaying = isPlaying, // Passes the Activity state DOWN
                     onTogglePlay = { requestedPlayState ->
-                        if (isPlaying != requestedPlayState) {
-                            // 1. Immediately kill the 'while' loop in the Sequencer
-                            isPlaying = requestedPlayState
+                        if (requestedPlayState) {
+                            // STARTING
+                            isPlaying = true
+                            writeBoolean(PLAY_STOP_UUID, true)
+                        } else {
+                            // NUCLEAR STOPPING SEQUENCE
+                            isPlaying = false // Kill the Sequencer's 'while' loop immediately
 
-                            if (!requestedPlayState) {
-                                // 2. We are STOPPING.
-                                // We need to clear the BLE queue.
-                                // A tiny delay ensures the last 'Speed' write has finished.
-                                Thread.sleep(50)
+                            lifecycleScope.launch {
+                                // 1. Send the STOP command first
                                 writeBoolean(PLAY_STOP_UUID, false)
+                                delay(50) // Give BLE stack time to breathe
 
-                                // 3. Optional: Reset speed to neutral 1.0x (1000)
-                                Thread.sleep(20)
+                                // 2. Force the neutral speed reset
                                 writeInt32(SPEED_UUID, 1000)
-                            } else {
-                                // 4. We are STARTING.
-                                writeBoolean(PLAY_STOP_UUID, true)
+
+                                // 3. Final verification write
+                                delay(50)
+                                writeBoolean(PLAY_STOP_UUID, false)
                             }
                         }
                     },
@@ -1180,14 +1201,16 @@ class MainActivity : ComponentActivity() {
 
     // Helper: Write 4 bytes (Int32 Little Endian)
     private fun writeInt32(charUuid: UUID, value: Int) {
-        // If we are in the process of stopping, ignore speed updates
-        // to keep the Bluetooth channel clear for the STOP command.
-        if (charUuid == SPEED_UUID && !isPlaying) return
-
+        // If it's a speed update and the sequence has ended/stopped, block the write
+        if (charUuid == SPEED_UUID && !isPlaying) {
+            Log.d("BLE_DEBUG", "Blocked speed write because motor is STOPPED")
+            return
+        }
         val gatt = activeGatt ?: return
         val service = gatt.getService(SERVICE_UUID) ?: return
         val char = service.getCharacteristic(charUuid) ?: return
 
+        // Ensure we aren't overwhelming the radio
         char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         val bytes = byteArrayOf(
             (value and 0xFF).toByte(),
