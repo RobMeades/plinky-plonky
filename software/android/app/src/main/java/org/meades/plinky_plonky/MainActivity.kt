@@ -297,6 +297,10 @@ class MainActivity : ComponentActivity() {
 
                             Log.d("BLE_DEBUG", "Read Speed: $currentSpeed. UI Synced.")
                             runOnUiThread {
+                                // Sync the UI knob to the hardware immediately on connection
+                                if (currentSpeed >= 0) {
+                                    knobValue = currentSpeed / 1000f
+                                }
                                 isConnected = true
                             }
                         }
@@ -440,19 +444,6 @@ class MainActivity : ComponentActivity() {
                 val activity = context as? Activity
                 activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
-        }
-    }
-
-    override fun onPause() {
-        super.onPause()
-        // If the app is pausing (which happens when the permission dialog pops up),
-        // we MUST disconnect to prevent the OS from trying to auto-resume the connection.
-        try {
-            activeGatt?.disconnect()
-            activeGatt?.close()
-            activeGatt = null
-        } catch (_: SecurityException) {
-            // We might not have permission to disconnect, that's fine.
         }
     }
 
@@ -626,12 +617,25 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        // If the motor is spinning, stop it so it doesn't run forever
-        // while the phone is in your pocket.
-        if (isPlaying) {
-            isPlaying = false
+
+        // 1. Try to send the stop command immediately
+        if (isConnected) {
             sendStopCommand()
         }
+
+        // 2. We need a tiny delay to let the BLE hardware actually transmit
+        // the "Stop" packet before we kill the GATT connection.
+        // 50ms is usually enough for one final packet.
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            try {
+                activeGatt?.disconnect()
+                activeGatt?.close()
+                activeGatt = null
+                isConnected = false
+            } catch (_: SecurityException) {
+                // Ignore
+            }
+        }, 100) // 100ms delay for a clean break
     }
 
     @Composable
