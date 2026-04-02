@@ -26,6 +26,7 @@ import android.app.Activity
 import android.bluetooth.*
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -47,6 +48,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import android.content.res.Configuration
 import android.view.WindowManager
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -98,6 +100,8 @@ const val DEFAULT_DURATION = 30f
 const val MIN_DURATION = 5f
 const val MAX_DURATION = 60f
 
+const val SPEED_MAX_HERTZ = 4f
+
 // UUIDs
 val SERVICE_UUID: UUID = UUID.fromString("0000FFE0-0000-1000-8000-00805F9B34FB")
 val PLAY_STOP_UUID: UUID = UUID.fromString("0000FFE1-0000-1000-8000-00805F9B34FB")
@@ -108,23 +112,47 @@ data class AutomationNode(
     val speed: Float        // 0.0 to 2.0 (Y-axis)
 )
 
+@Composable
+fun PermissionRequester(onGranted: () -> Unit) {
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        if (results.values.all { it }) onGranted()
+    }
+
+    // Automatically pop the dialog once this screen appears
+    LaunchedEffect(Unit) {
+        launcher.launch(arrayOf(
+            android.Manifest.permission.BLUETOOTH_SCAN,
+            android.Manifest.permission.BLUETOOTH_CONNECT,
+            android.Manifest.permission.ACCESS_FINE_LOCATION
+        ))
+    }
+
+    // A simple, clean "Wait" screen
+    Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+        Text("Waiting for Bluetooth permissions...", color = Color.White)
+    }
+}
+
 @SuppressLint("MissingPermission")
 class MainActivity : ComponentActivity() {
 
+    private var bluetoothAdapter: BluetoothAdapter? = null
     data class BleCommand(val uuid: UUID, val data: List<Byte>)
     var isPlaying by mutableStateOf(false)
     var currentSpeed by mutableIntStateOf(-1)
     // We use 'val' because the List Object (the buffer) never changes, only its contents.
     // We remove 'by' so we can access the .clear() and .addAll() methods directly.
-    val nodes = mutableStateListOf(AutomationNode(0f, 1f), AutomationNode(1f, 1f))
+    val nodes = mutableStateListOf(AutomationNode(0f, SPEED_MAX_HERTZ / 2), AutomationNode(1f, SPEED_MAX_HERTZ / 2))
     var durationSeconds by mutableFloatStateOf(DEFAULT_DURATION)
     var currentSequenceName by mutableStateOf<String?>(null)
     var isModified by mutableStateOf(false)
-    var originalNodes by mutableStateOf(listOf(AutomationNode(0f, 1f), AutomationNode(1f, 1f)))
+    var originalNodes by mutableStateOf(listOf(AutomationNode(0f, SPEED_MAX_HERTZ / 2), AutomationNode(1f, SPEED_MAX_HERTZ / 2)))
     var originalDuration by mutableFloatStateOf(DEFAULT_DURATION)
     var savedSequences by mutableStateOf(listOf<String>())
     var pendingImportData by mutableStateOf<List<Triple<String, List<AutomationNode>, Pair<Float, Float>>>?>(null)
-    var knobValue by mutableFloatStateOf(1f)
+    var knobValue by mutableFloatStateOf(SPEED_MAX_HERTZ / 2)
     var isPlayEnabled by mutableStateOf(false)
     // Timestamped user interactions to avoid race conditions with HW
     var lastUserTouchTime by mutableLongStateOf(0)
@@ -141,29 +169,9 @@ class MainActivity : ComponentActivity() {
     // A conflated channel only keeps the LATEST value, dropping older ones automatically
     private val speedChannel = kotlinx.coroutines.channels.Channel<Int>(kotlinx.coroutines.channels.Channel.CONFLATED)
 
-    private val requestPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        val allGranted = permissions.entries.all { it.value }
-        if (allGranted) {
-            Log.d("PERM", "All Bluetooth permissions granted")
-        } else {
-            Log.e("PERM", "Permissions denied. BLE will not work.")
-        }
-    }
-
-    private fun checkAndRequestPermissions() {
-        val permissions = arrayOf(
-                android.Manifest.permission.BLUETOOTH_SCAN,
-                android.Manifest.permission.BLUETOOTH_CONNECT,
-                android.Manifest.permission.ACCESS_FINE_LOCATION
-        )
-        requestPermissionLauncher.launch(permissions)
-    }
-
-    private val bluetoothAdapter: BluetoothAdapter? by lazy {
-        val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
-        manager.adapter
+    private fun hasRequiredPermissions(): Boolean {
+        val perms = arrayOf(android.Manifest.permission.BLUETOOTH_SCAN, android.Manifest.permission.BLUETOOTH_CONNECT)
+        return perms.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
     }
 
     // The serialized write execution
@@ -224,79 +232,82 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // The "Event Loop" for Bluetooth actions
-    private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.e("BLE_DEBUG", "GATT Error: $status. Cleaning up...")
-                gatt.close()
-                activeGatt = null
-                runOnUiThread { isConnected = false }
-                return
+    // The "Event Loop" for Bluetooth actions, only initialised once we
+    // have permissions checked
+    private val gattCallback by lazy {
+        object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.e("BLE_DEBUG", "GATT Error: $status. Cleaning up...")
+                    gatt.close()
+                    activeGatt = null
+                    runOnUiThread { isConnected = false }
+                    return
+                }
+
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    Log.d("BLE_DEBUG", "Connected. Wiping cache...")
+                    refreshDeviceCache(gatt)
+
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        gatt.discoverServices()
+                    }, 600)
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    Log.d("BLE_DEBUG", "Disconnected state reached.")
+                    gatt.close()
+                    activeGatt = null
+                    runOnUiThread { isConnected = false }
+                }
             }
 
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.d("BLE_DEBUG", "Connected. Wiping cache...")
-                refreshDeviceCache(gatt)
-
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    gatt.discoverServices()
-                }, 600)
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                Log.d("BLE_DEBUG", "Disconnected state reached.")
-                gatt.close()
-                activeGatt = null
-                runOnUiThread { isConnected = false }
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                gatt.discoverServices()
             }
-        }
 
-        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            gatt.discoverServices()
-        }
-
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d("BLE_DEBUG", "Services found. Starting Initial Read...")
-                // Start the chain: Read the Play/Stop status first
-                readCharacteristic(PLAY_STOP_UUID)
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.d("BLE_DEBUG", "Services found. Starting Initial Read...")
+                    // Start the chain: Read the Play/Stop status first
+                    readCharacteristic(PLAY_STOP_UUID)
+                }
             }
-        }
 
-        override fun onCharacteristicRead(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray,
-            status: Int
-        ) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                when (characteristic.uuid) {
-                    PLAY_STOP_UUID -> {
-                        isPlaying = value.getOrNull(0) == 0x01.toByte()
-                        Log.d("BLE_DEBUG", "Read PlayState: $isPlaying. Next: Read Speed.")
-                        // Chain the next read
-                        readCharacteristic(SPEED_UUID)
-                    }
-                    SPEED_UUID -> {
-                        // Convert 4 bytes (Little Endian) to Int
-                        currentSpeed = if (value.size >= 4) {
-                            (value[0].toInt() and 0xFF) or
-                                    ((value[1].toInt() and 0xFF) shl 8) or
-                                    ((value[2].toInt() and 0xFF) shl 16) or
-                                    ((value[3].toInt() and 0xFF) shl 24)
-                        } else -1
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray,
+                status: Int
+            ) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    when (characteristic.uuid) {
+                        PLAY_STOP_UUID -> {
+                            isPlaying = value.getOrNull(0) == 0x01.toByte()
+                            Log.d("BLE_DEBUG", "Read PlayState: $isPlaying. Next: Read Speed.")
+                            // Chain the next read
+                            readCharacteristic(SPEED_UUID)
+                        }
+                        SPEED_UUID -> {
+                            // Convert 4 bytes (Little Endian) to Int
+                            currentSpeed = if (value.size >= 4) {
+                                (value[0].toInt() and 0xFF) or
+                                        ((value[1].toInt() and 0xFF) shl 8) or
+                                        ((value[2].toInt() and 0xFF) shl 16) or
+                                        ((value[3].toInt() and 0xFF) shl 24)
+                            } else -1
 
-                        Log.d("BLE_DEBUG", "Read Speed: $currentSpeed. UI Synced.")
-                        runOnUiThread {
-                            isConnected = true
+                            Log.d("BLE_DEBUG", "Read Speed: $currentSpeed. UI Synced.")
+                            runOnUiThread {
+                                isConnected = true
+                            }
                         }
                     }
                 }
             }
-        }
 
-        override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            Log.d("BLE_DEBUG", "Write Confirmed: ${characteristic.uuid} with status $status")
-            completionDeferred?.complete(status) // This "wakes up" the worker
+            override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+                Log.d("BLE_DEBUG", "Write Confirmed: ${characteristic.uuid} with status $status")
+                completionDeferred?.complete(status) // This "wakes up" the worker
+            }
         }
     }
 
@@ -432,101 +443,134 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onPause() {
+        super.onPause()
+        // If the app is pausing (which happens when the permission dialog pops up),
+        // we MUST disconnect to prevent the OS from trying to auto-resume the connection.
+        try {
+            activeGatt?.disconnect()
+            activeGatt?.close()
+            activeGatt = null
+        } catch (_: SecurityException) {
+            // We might not have permission to disconnect, that's fine.
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        checkAndRequestPermissions() // Kick off the dialog on first launch
-        startBleWorker()  // Start the background  BLE processor
         setContent {
-            val configuration = androidx.compose.ui.platform.LocalConfiguration.current
-            val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-            var status by remember { mutableStateOf("Ready") }
+            val permissionsGranted = remember { mutableStateOf(hasRequiredPermissions()) }
+            if (permissionsGranted.value) {
+                // This code only runs when permissions are 100% granted.
+                LaunchedEffect(Unit) {
+                    // NOW it is safe to touch the system services
+                    val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+                    bluetoothAdapter = manager.adapter
 
-            KeepScreenOn(enabled = isPlaying)
+                    // Start the background  BLE processor
+                    startBleWorker()
 
-            LaunchedEffect(isLandscape) {
-                // Rotated: ensure the motor is OFF
-                // to avoid any surprises
-                isPlaying = false
-                enqueueBoolean(PLAY_STOP_UUID, false)
-                if (!isLandscape) {
-                    isPlayEnabled = false
+                    //  Seamlessly try to find the device
+                    // the moment the "Waiting" screen disappears
+                    autoConnect()
                 }
-            }
 
-            if (isLandscape) {
-                // If we're switching to Landscape mode,
-                // read the current speed first so that it
-                // is not stale when we switch back to
-                // Portrait mode
-                readCharacteristic(SPEED_UUID)
-                LandscapeSequencer(
-                    isPlaying = isPlaying, // Passes the Activity state DOWN
-                    onTogglePlay = { requestedState ->
-                        isPlaying = requestedState
+                val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+                val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                var status by remember { mutableStateOf("Ready") }
 
-                        if (requestedState) {
-                            // Just start; the sequencer loop handles the speed updates
-                            enqueueBoolean(PLAY_STOP_UUID, true)
-                        } else {
-                            // Stop and clear the speed queue
-                            while(speedChannel.tryReceive().isSuccess) { /* drain */ }
-                            enqueueBoolean(PLAY_STOP_UUID, false)
-                        }
-                    },
-                    onSpeedUpdate = { enqueueInt32(SPEED_UUID, it) },
-                    nodes = nodes, // Pass the current value
-                    onNodesChange = { newNodes ->
-                        nodes.clear()
-                        nodes.addAll(newNodes) }, // When the UI wants to change it, update the Activity variable
-                    durationSeconds = durationSeconds,
-                    onDurationChange = { durationSeconds = it },
-                    currentSequenceName = currentSequenceName,
-                    onNameChange = { currentSequenceName = it },
-                    isModified = isModified,
-                    onModifiedChange = { isModified = it },
-                    originalNodes = originalNodes,
-                    onOriginalNodesChange = {originalNodes = it },
-                    originalDuration = originalDuration,
-                    onOriginalDurationChange = { originalDuration = it },
-                )
+                KeepScreenOn(enabled = isPlaying)
+
+                LaunchedEffect(isLandscape) {
+                    // Rotated: ensure the motor is OFF
+                    // to avoid any surprises
+                    isPlaying = false
+                    enqueueBoolean(PLAY_STOP_UUID, false)
+                    if (!isLandscape) {
+                        isPlayEnabled = false
+                    }
+                }
+
+                if (isLandscape) {
+                    // If we're switching to Landscape mode,
+                    // read the current speed first so that it
+                    // is not stale when we switch back to
+                    // Portrait mode
+                    readCharacteristic(SPEED_UUID)
+                    LandscapeSequencer(
+                        isPlaying = isPlaying, // Passes the Activity state DOWN
+                        onTogglePlay = { requestedState ->
+                            isPlaying = requestedState
+
+                            if (requestedState) {
+                                // Just start; the sequencer loop handles the speed updates
+                                enqueueBoolean(PLAY_STOP_UUID, true)
+                            } else {
+                                // Stop and clear the speed queue
+                                while(speedChannel.tryReceive().isSuccess) { /* drain */ }
+                                enqueueBoolean(PLAY_STOP_UUID, false)
+                            }
+                        },
+                        onSpeedUpdate = { enqueueInt32(SPEED_UUID, it) },
+                        nodes = nodes, // Pass the current value
+                        onNodesChange = { newNodes ->
+                            nodes.clear()
+                            nodes.addAll(newNodes) }, // When the UI wants to change it, update the Activity variable
+                        durationSeconds = durationSeconds,
+                        onDurationChange = { durationSeconds = it },
+                        currentSequenceName = currentSequenceName,
+                        onNameChange = { currentSequenceName = it },
+                        isModified = isModified,
+                        onModifiedChange = { isModified = it },
+                        originalNodes = originalNodes,
+                        onOriginalNodesChange = {originalNodes = it },
+                        originalDuration = originalDuration,
+                        onOriginalDurationChange = { originalDuration = it },
+                    )
+                } else {
+                    PortraitController(
+                        isConnected = isConnected,
+                        isPlaying = isPlaying,
+                        currentSpeed = currentSpeed,
+                        status = status,
+                        onScan = {
+                            status = "Scanning..."
+                            startReliableScan { device ->
+                                status = "Connecting..."
+                                // Use transport LE to bypass dual-mode issues on modern phones
+                                activeGatt = device.connectGatt(
+                                    this@MainActivity,
+                                    false,
+                                    gattCallback,
+                                    BluetoothDevice.TRANSPORT_LE
+                                )
+                            }
+                        },
+
+                        // Update the Activity state AND send the BLE command
+                        onTogglePlay = { requestedState ->
+                            isPlayEnabled = requestedState // Capture the actual user intent
+
+                            if (requestedState) {
+                                isPlaying = true
+                                enqueueInt32(SPEED_UUID, (knobValue * 1000).toInt())
+                                enqueueBoolean(PLAY_STOP_UUID, true)
+                            } else {
+                                isPlaying = false
+                                while(speedChannel.tryReceive().isSuccess) { /* Drain queue */ }
+                                enqueueBoolean(PLAY_STOP_UUID, false)
+                            }
+                        },
+                        onSpeedUpdate = { enqueueInt32(SPEED_UUID, it) },
+                        lastUserTouchTime = lastUserTouchTime,
+                        onUpdateTouchTime = { lastUserTouchTime = it }
+                    )
+                }
             } else {
-                PortraitController(
-                    isConnected = isConnected,
-                    isPlaying = isPlaying,
-                    currentSpeed = currentSpeed,
-                    status = status,
-                    onScan = {
-                        status = "Scanning..."
-                        startReliableScan { device ->
-                            status = "Connecting..."
-                            // Use transport LE to bypass dual-mode issues on modern phones
-                            activeGatt = device.connectGatt(
-                                this@MainActivity,
-                                false,
-                                gattCallback,
-                                BluetoothDevice.TRANSPORT_LE
-                            )
-                        }
-                    },
-
-                    // Update the Activity state AND send the BLE command
-                    onTogglePlay = { requestedState ->
-                        isPlayEnabled = requestedState // Capture the actual user intent
-
-                        if (requestedState) {
-                            isPlaying = true
-                            enqueueInt32(SPEED_UUID, (knobValue * 1000).toInt())
-                            enqueueBoolean(PLAY_STOP_UUID, true)
-                        } else {
-                            isPlaying = false
-                            while(speedChannel.tryReceive().isSuccess) { /* Drain queue */ }
-                            enqueueBoolean(PLAY_STOP_UUID, false)
-                        }
-                    },
-                    onSpeedUpdate = { enqueueInt32(SPEED_UUID, it) },
-                    lastUserTouchTime = lastUserTouchTime,
-                    onUpdateTouchTime = { lastUserTouchTime = it }
-                )
+                // This shows on the very first launch only.
+                PermissionRequester(onGranted = {
+                    permissionsGranted.value = true
+                })
             }
         }
     }
@@ -551,20 +595,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun autoConnect() {
-        // If activeGatt is not null, we might still be linked!
-        // Try to discover services to see if it's alive.
+        // Safety check: Don't scan if we are already connected or
+        // if permissions aren't actually handled yet.
+        if (isConnected || !hasRequiredPermissions()) return
+
         activeGatt?.let {
             Log.d("BLE_DEBUG", "Already have a GATT handle, checking services...")
             it.discoverServices()
             return
         }
 
-        // If we're already connected, don't double up
-        if (isConnected) return
-
         Log.d("BLE_DEBUG", "Triggering auto-reconnect...")
         startReliableScan { device ->
-            // We found it, now connect
             activeGatt = device.connectGatt(
                 this@MainActivity,
                 false,
@@ -738,7 +780,7 @@ class MainActivity : ComponentActivity() {
                             // 1. Hit Test
                             val hitIndex = nodes.indexOfFirst {
                                 val nodeX = leftPaddingPx - panOffset + (it.timePercent * currentSize.first)
-                                val nodeY = edgePaddingPx + (1f - (it.speed / 2f)) * currentSize.second
+                                val nodeY = edgePaddingPx + (1f - (it.speed / SPEED_MAX_HERTZ)) * currentSize.second
                                 val dx = nodeX - down.position.x
                                 val dy = nodeY - down.position.y
                                 (dx * dx + dy * dy) < 10000f
@@ -837,10 +879,10 @@ class MainActivity : ComponentActivity() {
                                     }
 
                                     if (hasMovedPastSlop) {
-                                        val (uW, uH) = getUsableSize(size, zoomFactor)
+                                        val (usableWidth, usableHeight) = getUsableSize(size, zoomFactor)
 
-                                        val rawT = ((dragChange.position.x + panOffset - leftPaddingPx) / uW).coerceIn(0f, 1f)
-                                        val newS = (1f - ((dragChange.position.y - edgePaddingPx) / uH)).coerceIn(0f, 1f) * 2f
+                                        val rawT = ((dragChange.position.x + panOffset - leftPaddingPx) / usableWidth).coerceIn(0f, 1f)
+                                        val newS = (1f - ((dragChange.position.y - edgePaddingPx) / usableHeight)).coerceIn(0f, 1f) * SPEED_MAX_HERTZ
 
                                         // --- Your Snap/Boundary Math ---
                                         val minT = if (draggedNodeIndex > 0) nodes[draggedNodeIndex - 1].timePercent + 0.005f else 0f
@@ -870,7 +912,7 @@ class MainActivity : ComponentActivity() {
                                     val isDoubleTap = (currentTime - lastTapTime) < viewConfiguration.doubleTapTimeoutMillis
 
                                     if (isDoubleTap) {
-                                        val (uW, uH) = getUsableSize(size, zoomFactor)
+                                        val (usableWidth, usableHeight) = getUsableSize(size, zoomFactor)
                                         if (hitIndex != -1) {
                                             // Delete node (except ends)
                                             if (hitIndex != 0 && hitIndex != nodes.size - 1) {
@@ -880,8 +922,8 @@ class MainActivity : ComponentActivity() {
                                             }
                                         } else {
                                             // Create node
-                                            val t = ((up.position.x + panOffset - leftPaddingPx) / uW).coerceIn(0f, 1f)
-                                            val s = (1f - ((up.position.y - edgePaddingPx) / uH)).coerceIn(0f, 1f) * 2f
+                                            val t = ((up.position.x + panOffset - leftPaddingPx) / usableWidth).coerceIn(0f, 1f)
+                                            val s = (1f - ((up.position.y - edgePaddingPx) / usableHeight)).coerceIn(0f, SPEED_MAX_HERTZ / 2) * SPEED_MAX_HERTZ
 
                                             // Create-time speed snapping
                                             var finalS = s
@@ -911,8 +953,8 @@ class MainActivity : ComponentActivity() {
                 val gridColor = Color.White.copy(alpha = 0.15f) // Subtle but visible
 
                 // 2. DRAW HORIZONTAL GRID (Speed)
-                for (i in 0..4) {
-                    val y = edgePaddingPx + (usableHeight * (i / 4f))
+                for (i in 0..SPEED_MAX_HERTZ.toInt()) {
+                    val y = edgePaddingPx + (usableHeight * (i.toFloat() / SPEED_MAX_HERTZ))
                     drawLine(
                         color = gridColor,
                         start = Offset(leftPaddingPx - panOffset, y),
@@ -920,8 +962,8 @@ class MainActivity : ComponentActivity() {
                         strokeWidth = 1.dp.toPx()
                     )
 
-                    // Speed Labels (0.0, 0.5, 1.0, 1.5, 2.0)
-                    val speedVal = 2.0f - (i * 0.5f)
+                    // Speed Labels
+                    val speedVal = SPEED_MAX_HERTZ.toInt() - i
                     drawText(
                         textMeasurer = textMeasurer,
                         text = "$speedVal Hz",
@@ -952,7 +994,7 @@ class MainActivity : ComponentActivity() {
                 nodes.forEachIndexed { index, node ->
                     // USE THE USABLE DIMENSIONS HERE
                     val centerX = leftPaddingPx - panOffset + (node.timePercent * usableWidth)
-                    val centerY = edgePaddingPx + (1f - (node.speed / 2f)) * usableHeight
+                    val centerY = edgePaddingPx + (1f - (node.speed / SPEED_MAX_HERTZ)) * usableHeight
 
                     val isDragging = index == draggedNodeIndex
                     val isLastSelected = index == lastSelectedIndex
@@ -1037,16 +1079,6 @@ class MainActivity : ComponentActivity() {
                     expanded = showLoadMenu,
                     onDismissRequest = { showLoadMenu = false }
                 ) {
-                    if (savedSequences.isEmpty()) {
-                        DropdownMenuItem(
-                            text = { Text("RESTORE FROM FILE", color = Color.Black, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold) },
-                            onClick = {
-                                showLoadMenu = false
-                                importJsonLauncher.launch(arrayOf("application/json"))
-                            }
-                        )
-                    }
-
                     savedSequences.forEach { name ->
                         DropdownMenuItem(
                             text = {
@@ -1494,33 +1526,38 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun startReliableScan(onDeviceFound: (BluetoothDevice) -> Unit) {
+        if (!hasRequiredPermissions()) {
+            Log.d("BLE_DEBUG", "Scan aborted: Permissions not yet granted.")
+            return
+        }
+
         val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
         val scanner = bluetoothAdapter?.bluetoothLeScanner
 
-        // --- NUCLEAR STEP 1: KILL SYSTEM ZOMBIES ---
-        // This finds devices the OS thinks are connected, even if our app just started
-        val alreadyConnected = manager.getConnectedDevices(BluetoothProfile.GATT)
+        // Now it is safe to check for zombies
+        val alreadyConnected = try {
+            manager.getConnectedDevices(BluetoothProfile.GATT)
+        } catch (_: SecurityException) {
+            emptyList()
+        }
+
         alreadyConnected.forEach { device ->
             if (device.name?.contains("Plinky", ignoreCase = true) == true) {
                 Log.d("BLE_DEBUG", "Nuclear: Killing system zombie at ${device.address}")
-                // We must connect to it just to call disconnect/close to free the radio
                 val tempGatt = device.connectGatt(this, false, object : BluetoothGattCallback() {})
                 tempGatt.disconnect()
                 tempGatt.close()
             }
         }
 
-        // --- NUCLEAR STEP 2: AGGRESSIVE RECOVERY ---
-        // Look for "Bonded" (paired) devices that might be hanging
+        // ... rest of your existing scanning logic ...
         bluetoothAdapter?.bondedDevices?.forEach { device ->
             if (device.name?.contains("Plinky", ignoreCase = true) == true) {
-                Log.d("BLE_DEBUG", "Nuclear: Found bonded device, attempting direct connect")
                 onDeviceFound(device)
-                return // Skip scanning if we found a bonded match
+                return
             }
         }
 
-        // Standard aggressive scan as fallback
         val settings = android.bluetooth.le.ScanSettings.Builder()
             .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
@@ -1646,7 +1683,7 @@ fun RotaryKnob(
 
     val startAngle = 135f
     val sweepAngle = 270f
-    val visualAngle = startAngle + (value / 2.0f) * sweepAngle
+    val visualAngle = startAngle + (value / SPEED_MAX_HERTZ) * sweepAngle
 
     Canvas(modifier = modifier
         .size(200.dp)
@@ -1671,7 +1708,7 @@ fun RotaryKnob(
                         else -> normalizedAngle
                     }
 
-                    val newValue = (snappedAngle / 270f) * 2.0f
+                    val newValue = (snappedAngle / 270f) * SPEED_MAX_HERTZ
 
                     // 1. LIMIT HAPTICS (Using lastVibratedValue)
                     if ((lastVibratedValue > 0f && newValue == 0f) ||
@@ -1689,7 +1726,7 @@ fun RotaryKnob(
 
                     // CRITICAL: Update the tracker IMMEDIATELY
                     lastVibratedValue = newValue
-                    updatedOnValueChange(newValue.coerceIn(0f, 2f))
+                    updatedOnValueChange(newValue.coerceIn(0f, SPEED_MAX_HERTZ))
                 }
                 change.consume()
             }
@@ -1750,8 +1787,8 @@ fun DrawScope.drawBezierPath(
     leftPadding: Float,
     @Suppress("UNUSED_PARAMETER") rightPadding: Float,
     panOffset: Float,
-    uWidth: Float,
-    uHeight: Float,
+    usableWidth: Float,
+    usableHeight: Float,
     tension: Float = DEFAULT_TENSION
 ) {
     if (nodes.size < 2) return
@@ -1759,8 +1796,8 @@ fun DrawScope.drawBezierPath(
 
     fun getCoordinate(node: AutomationNode): Offset {
         return Offset(
-            leftPadding - panOffset + (node.timePercent * uWidth),
-            padding + (1f - (node.speed / 2f)) * uHeight
+            leftPadding - panOffset + (node.timePercent * usableWidth),
+            padding + (1f - (node.speed / SPEED_MAX_HERTZ)) * usableHeight
         )
     }
 
