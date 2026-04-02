@@ -16,12 +16,13 @@
 
 /* This written by Google Gemini from my prompts, over several days
  * with several arguments/disagreements and not a few regressions
- * and "imaginative" outcomes along the way.  It still emits warnings
+ * and "imaginative" outcomes along the way.  It still emits warnings.
  * but I dare not touch it: good enough is good enough. */
 
 package org.meades.plinky_plonky
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.bluetooth.*
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
@@ -45,6 +46,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import android.content.res.Configuration
+import android.view.WindowManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -69,13 +71,21 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.lifecycle.lifecycleScope
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.util.Locale
 import java.util.UUID
 import kotlin.math.cos
 import kotlin.math.pow
 import kotlin.math.sin
+import androidx.core.content.edit
 
 // Global Configuration
 const val DEFAULT_TENSION = 4f
@@ -101,8 +111,9 @@ data class AutomationNode(
 @SuppressLint("MissingPermission")
 class MainActivity : ComponentActivity() {
 
+    data class BleCommand(val uuid: UUID, val data: List<Byte>)
     var isPlaying by mutableStateOf(false)
-    var currentSpeed by mutableIntStateOf(0)
+    var currentSpeed by mutableIntStateOf(-1)
     // We use 'val' because the List Object (the buffer) never changes, only its contents.
     // We remove 'by' so we can access the .clear() and .addAll() methods directly.
     val nodes = mutableStateListOf(AutomationNode(0f, 1f), AutomationNode(1f, 1f))
@@ -111,13 +122,27 @@ class MainActivity : ComponentActivity() {
     var isModified by mutableStateOf(false)
     var originalNodes by mutableStateOf(listOf(AutomationNode(0f, 1f), AutomationNode(1f, 1f)))
     var originalDuration by mutableFloatStateOf(DEFAULT_DURATION)
+    var savedSequences by mutableStateOf(listOf<String>())
+    var pendingImportData by mutableStateOf<List<Triple<String, List<AutomationNode>, Pair<Float, Float>>>?>(null)
+    var knobValue by mutableFloatStateOf(1f)
+    var isPlayEnabled by mutableStateOf(false)
+    // Timestamped user interactions to avoid race conditions with HW
+    var lastUserTouchTime by mutableLongStateOf(0)
 
     // Keep track of the active connection
     private var activeGatt: BluetoothGatt? = null
     private var isConnected by mutableStateOf(false)
 
+    // Command queue as BLE writes in Android are asynchronous and
+    // will silently lose commands that arrive too quickly
+    private val commandQueue = kotlinx.coroutines.channels.Channel<BleCommand>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+    private val bleMutex = kotlinx.coroutines.sync.Mutex()
+    private var completionDeferred: kotlinx.coroutines.CompletableDeferred<Int>? = null
+    // A conflated channel only keeps the LATEST value, dropping older ones automatically
+    private val speedChannel = kotlinx.coroutines.channels.Channel<Int>(kotlinx.coroutines.channels.Channel.CONFLATED)
+
     private val requestPermissionLauncher = registerForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
+        ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         val allGranted = permissions.entries.all { it.value }
         if (allGranted) {
@@ -128,15 +153,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkAndRequestPermissions() {
-        val permissions = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION.SDK_INT) {
-            arrayOf(
+        val permissions = arrayOf(
                 android.Manifest.permission.BLUETOOTH_SCAN,
                 android.Manifest.permission.BLUETOOTH_CONNECT,
                 android.Manifest.permission.ACCESS_FINE_LOCATION
-            )
-        } else {
-            arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION)
-        }
+        )
         requestPermissionLauncher.launch(permissions)
     }
 
@@ -145,29 +166,87 @@ class MainActivity : ComponentActivity() {
         manager.adapter
     }
 
+    // The serialized write execution
+    private suspend fun executeSafeWrite(charUuid: UUID, bytes: List<Byte>): Boolean {
+        val gatt = activeGatt ?: return false
+        val char = gatt.getService(SERVICE_UUID)?.getCharacteristic(charUuid) ?: return false
+
+        return bleMutex.withLock {
+            completionDeferred = kotlinx.coroutines.CompletableDeferred()
+
+            // Use the new Android 13+ compatible write
+            gatt.writeCharacteristic(char, bytes.toByteArray(), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+
+            // Wait up to 500ms for hardware to say "Got it"
+            withContext(kotlinx.coroutines.Dispatchers.IO) {
+                try {
+                    kotlinx.coroutines.withTimeout(500) {
+                        completionDeferred?.await() == BluetoothGatt.GATT_SUCCESS
+                    }
+                } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+                    Log.e("BLE_DEBUG", "Write Timeout for $charUuid")
+                    false
+                }
+            }
+        }
+    }
+
+    // Start BLE command queu processor
+    private fun startBleWorker() {
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            for (command in commandQueue) {
+                Log.d("BLE_DEBUG", "Writing command: $command")
+                executeSafeWrite(command.uuid, command.data)
+            }
+        }
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            for (speedValue in speedChannel) {
+                // Convert Int to 4-byte array (Little Endian)
+                val bytes = listOf(
+                    (speedValue and 0xFF).toByte(),
+                    ((speedValue shr 8) and 0xFF).toByte(),
+                    ((speedValue shr 16) and 0xFF).toByte(),
+                    ((speedValue shr 24) and 0xFF).toByte()
+                )
+                // Use the same mutex-protected write to avoid collisions
+                Log.d("BLE_DEBUG", "Writing speed: $speedValue")
+                executeSafeWrite(SPEED_UUID, bytes)
+            }
+        }
+    }
+
+    private fun sendStopCommand() {
+        // We only send this if we are actually connected
+        if (isConnected) {
+            // This puts the STOP command at the end of the queue
+            enqueueBoolean(PLAY_STOP_UUID, false)
+            Log.d("BLE_DEBUG", "Stop command queued for exit.")
+        }
+    }
+
     // The "Event Loop" for Bluetooth actions
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.d("BLE_DEBUG", "Connected. Wiping cache...")
-
-                // Wipe the "brain"
-                refreshDeviceCache(gatt)
-
-                // Give the hardware a moment to breathe after the wipe
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    Log.d("BLE_DEBUG", "Discovering services post-wipe...")
-                    gatt.discoverServices()
-                }, 600)
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                gatt.close()
-                activeGatt = null
-                runOnUiThread { isConnected = false }
-            } else if (status != BluetoothGatt.GATT_SUCCESS) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.e("BLE_DEBUG", "GATT Error: $status. Cleaning up...")
                 gatt.close()
                 activeGatt = null
+                runOnUiThread { isConnected = false }
                 return
+            }
+
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                Log.d("BLE_DEBUG", "Connected. Wiping cache...")
+                refreshDeviceCache(gatt)
+
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    gatt.discoverServices()
+                }, 600)
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                Log.d("BLE_DEBUG", "Disconnected state reached.")
+                gatt.close()
+                activeGatt = null
+                runOnUiThread { isConnected = false }
             }
         }
 
@@ -204,35 +283,20 @@ class MainActivity : ComponentActivity() {
                                     ((value[1].toInt() and 0xFF) shl 8) or
                                     ((value[2].toInt() and 0xFF) shl 16) or
                                     ((value[3].toInt() and 0xFF) shl 24)
-                        } else 0
+                        } else -1
 
                         Log.d("BLE_DEBUG", "Read Speed: $currentSpeed. UI Synced.")
-                        runOnUiThread { isConnected = true }
+                        runOnUiThread {
+                            isConnected = true
+                        }
                     }
                 }
             }
         }
 
-        override fun onCharacteristicWrite(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            status: Int
-        ) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d("BLE_DEBUG", "Write Successful: ${characteristic.uuid}")
-
-                // If we just wrote to the Play/Stop characteristic,
-                // we might want to re-read it or just trust the toggle.
-                if (characteristic.uuid == PLAY_STOP_UUID) {
-                    // We use runOnUiThread because gattCallback runs on a background thread,
-                    // but Compose state should be modified on the Main thread.
-                    runOnUiThread {
-                        // You can either read it back to be sure:
-                        //readCharacteristic(PLAY_STOP_UUID)
-                        // Or if you want to be quick, toggle it here.
-                    }
-                }
-            }
+        override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            Log.d("BLE_DEBUG", "Write Confirmed: ${characteristic.uuid} with status $status")
+            completionDeferred?.complete(status) // This "wakes up" the worker
         }
     }
 
@@ -257,51 +321,159 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val exportJsonLauncher = registerForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        uri?.let { saveJsonToUri(it) }
+    }
+
+    private val importJsonLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { loadJsonFromUri(it) }
+    }
+
+    private fun saveJsonToUri(uri: android.net.Uri) {
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val allNames = getAllSavedNames(this@MainActivity)
+                val rootArray = JSONArray()
+
+                allNames.forEach { name ->
+                    val data = loadSequence(this@MainActivity, name) ?: return@forEach
+                    val seqObj = JSONObject().apply {
+                        put("name", name)
+                        put("duration", data.second.toDouble())
+                        put("tension", data.third.toDouble())
+                        val nodesArray = JSONArray()
+                        data.first.forEach { node ->
+                            nodesArray.put(JSONObject().apply {
+                                put("t", node.timePercent.toDouble())
+                                put("s", node.speed.toDouble())
+                            })
+                        }
+                        put("nodes", nodesArray)
+                    }
+                    rootArray.put(seqObj)
+                }
+
+                contentResolver.openOutputStream(uri)?.use { it.write(rootArray.toString(2).toByteArray()) }
+            } catch (e: Exception) {
+                Log.e("EXPORT", "Failed to export", e)
+            }
+        }
+    }
+
+    private fun loadJsonFromUri(uri: android.net.Uri) {
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                // 1. Read the file from disk (Background Thread)
+                val jsonString = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: return@launch
+                val rootArray = JSONArray(jsonString)
+                val tempList = mutableListOf<Triple<String, List<AutomationNode>, Pair<Float, Float>>>()
+
+                for (i in 0 until rootArray.length()) {
+                    val obj = rootArray.getJSONObject(i)
+                    val name = obj.getString("name")
+                    val duration = obj.getDouble("duration").toFloat()
+                    val tension = obj.getDouble("tension").toFloat()
+                    val nodesArray = obj.getJSONArray("nodes")
+                    val importedNodes = mutableListOf<AutomationNode>()
+
+                    for (j in 0 until nodesArray.length()) {
+                        val n = nodesArray.getJSONObject(j)
+                        importedNodes.add(AutomationNode(
+                            n.getDouble("t").toFloat(),
+                            n.getDouble("s").toFloat()
+                        ))
+                    }
+                    tempList.add(Triple(name, importedNodes, Pair(duration, tension)))
+                }
+
+                // 2. Process results on the UI Thread (Main Thread)
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    val existingNames = getAllSavedNames(this@MainActivity)
+                    val conflicts = tempList.map { it.first }.filter { it in existingNames }
+
+                    if (conflicts.isNotEmpty()) {
+                        // There are naming conflicts, trigger the AlertDialog
+                        pendingImportData = tempList
+                    } else {
+                        // No conflicts, save everything immediately
+                        tempList.forEach { (name, nodes, params) ->
+                            saveSequence(this@MainActivity, name, nodes, params.first, params.second)
+                        }
+
+                        // Trigger a refresh of the UI state list
+                        savedSequences = getAllSavedNames(this@MainActivity)
+
+                        android.widget.Toast.makeText(this@MainActivity,
+                            "Imported ${tempList.size} sequences", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("IMPORT", "Failed to import JSON", e)
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    android.widget.Toast.makeText(this@MainActivity,
+                        "Import failed: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    @Composable
+    fun KeepScreenOn(enabled: Boolean) {
+        val context = LocalContext.current
+        DisposableEffect(enabled) {
+            if (enabled) {
+                val activity = context as? Activity
+                activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+            onDispose {
+                val activity = context as? Activity
+                activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         checkAndRequestPermissions() // Kick off the dialog on first launch
+        startBleWorker()  // Start the background  BLE processor
         setContent {
             val configuration = androidx.compose.ui.platform.LocalConfiguration.current
             val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
             var status by remember { mutableStateOf("Ready") }
 
-            // If we just rotated into Landscape, ensure the motor is OFF
-            // so the Sequencer can take clean control.
+            KeepScreenOn(enabled = isPlaying)
+
             LaunchedEffect(isLandscape) {
-                if (isLandscape && isPlaying) {
-                    isPlaying = false
-                    writeBoolean(PLAY_STOP_UUID, false)
-                    writeInt32(SPEED_UUID, 1000) // Reset to 1.0x neutral
+                // Rotated: ensure the motor is OFF
+                // to avoid any surprises
+                isPlaying = false
+                enqueueBoolean(PLAY_STOP_UUID, false)
+                if (!isLandscape) {
+                    isPlayEnabled = false
                 }
             }
 
             if (isLandscape) {
+                // If we're switching to Landscape mode,
+                // read the current speed first so that it
+                // is not stale when we switch back to
+                // Portrait mode
+                readCharacteristic(SPEED_UUID)
                 LandscapeSequencer(
                     isPlaying = isPlaying, // Passes the Activity state DOWN
-                    onTogglePlay = { requestedPlayState ->
-                        if (requestedPlayState) {
-                            // STARTING
-                            isPlaying = true
-                            writeBoolean(PLAY_STOP_UUID, true)
+                    onTogglePlay = { requestedState ->
+                        isPlaying = requestedState
+
+                        if (requestedState) {
+                            // Just start; the sequencer loop handles the speed updates
+                            enqueueBoolean(PLAY_STOP_UUID, true)
                         } else {
-                            // NUCLEAR STOPPING SEQUENCE
-                            isPlaying = false // Kill the Sequencer's 'while' loop immediately
-
-                            lifecycleScope.launch {
-                                // 1. Send the STOP command first
-                                writeBoolean(PLAY_STOP_UUID, false)
-                                delay(50) // Give BLE stack time to breathe
-
-                                // 2. Force the neutral speed reset
-                                writeInt32(SPEED_UUID, 1000)
-
-                                // 3. Final verification write
-                                delay(50)
-                                writeBoolean(PLAY_STOP_UUID, false)
-                            }
+                            // Stop and clear the speed queue
+                            while(speedChannel.tryReceive().isSuccess) { /* drain */ }
+                            enqueueBoolean(PLAY_STOP_UUID, false)
                         }
                     },
-                    onSpeedUpdate = { writeInt32(SPEED_UUID, it) },
+                    onSpeedUpdate = { enqueueInt32(SPEED_UUID, it) },
                     nodes = nodes, // Pass the current value
                     onNodesChange = { newNodes ->
                         nodes.clear()
@@ -337,40 +509,86 @@ class MainActivity : ComponentActivity() {
                         }
                     },
 
-                    // FIX: Update the Activity state AND send the BLE command
+                    // Update the Activity state AND send the BLE command
                     onTogglePlay = { requestedState ->
-                        if (isPlaying != requestedState) {
-                            isPlaying = requestedState
-                            writeBoolean(PLAY_STOP_UUID, requestedState)
+                        isPlayEnabled = requestedState // Capture the actual user intent
+
+                        if (requestedState) {
+                            isPlaying = true
+                            enqueueInt32(SPEED_UUID, (knobValue * 1000).toInt())
+                            enqueueBoolean(PLAY_STOP_UUID, true)
+                        } else {
+                            isPlaying = false
+                            while(speedChannel.tryReceive().isSuccess) { /* Drain queue */ }
+                            enqueueBoolean(PLAY_STOP_UUID, false)
                         }
                     },
-                    onUpdateSpeed = { writeInt32(SPEED_UUID, it) }
+                    onSpeedUpdate = { enqueueInt32(SPEED_UUID, it) },
+                    lastUserTouchTime = lastUserTouchTime,
+                    onUpdateTouchTime = { lastUserTouchTime = it }
                 )
             }
         }
     }
 
     override fun onDestroy() {
-        super.onDestroy()
-        // Disconnect and close the GATT client to prevent zombie connections
-        activeGatt?.let { gatt ->
-            gatt.disconnect()
-            gatt.close()
+        // Final safety stop
+        sendStopCommand()
+
+        // Give the BLE worker a tiny moment to flush the queue
+        // before we kill the GATT client.
+        lifecycleScope.launch {
+            delay(100)
+            activeGatt?.let { gatt ->
+                gatt.disconnect()
+                gatt.close()
+            }
+            activeGatt = null
+            isConnected = false
+            Log.d("BLE_DEBUG", "App destroyed: Resources released.")
         }
-        activeGatt = null
-        isConnected = false
-        Log.d("BLE_DEBUG", "Activity Destroyed: GATT closed and resources released.")
+        super.onDestroy()
+    }
+
+    private fun autoConnect() {
+        // If activeGatt is not null, we might still be linked!
+        // Try to discover services to see if it's alive.
+        activeGatt?.let {
+            Log.d("BLE_DEBUG", "Already have a GATT handle, checking services...")
+            it.discoverServices()
+            return
+        }
+
+        // If we're already connected, don't double up
+        if (isConnected) return
+
+        Log.d("BLE_DEBUG", "Triggering auto-reconnect...")
+        startReliableScan { device ->
+            // We found it, now connect
+            activeGatt = device.connectGatt(
+                this@MainActivity,
+                false,
+                gattCallback,
+                BluetoothDevice.TRANSPORT_LE
+            )
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // If we return and find we are disconnected, try to find our device again
+        if (!isConnected) {
+            autoConnect()
+        }
     }
 
     override fun onStop() {
         super.onStop()
-        // If we aren't playing, don't leave the connection 'dangling'
-        if (!isPlaying) {
-            Log.d("BLE_DEBUG", "App stopped. Cleaning up BLE to prevent zombies.")
-            activeGatt?.disconnect()
-            activeGatt?.close()
-            activeGatt = null
-            isConnected = false
+        // If the motor is spinning, stop it so it doesn't run forever
+        // while the phone is in your pocket.
+        if (isPlaying) {
+            isPlaying = false
+            sendStopCommand()
         }
     }
 
@@ -396,9 +614,8 @@ class MainActivity : ComponentActivity() {
         val density = LocalDensity.current
         val edgePaddingPx = remember(density) { with(density) { 24.dp.toPx() } }
         val leftPaddingPx = remember(density) { with(density) { 60.dp.toPx() } }
-        val rightPaddingPx = leftPaddingPx
-        val bottomBarHeightDp = if (isPlaying) 60.dp else 100.dp
-        val bottomBarHeightPx = with(density) { bottomBarHeightDp.toPx() }
+        val rightPaddingPx = remember(density) { with(density) { 60.dp.toPx() } }
+        val bottomBarHeightPx = with(density) { (if (isPlaying) 60.dp else 100.dp).toPx() }
         var zoomFactor by remember { mutableFloatStateOf(1f) }
         var panOffset by remember { mutableFloatStateOf(0f) }
         val automationPath = remember { Path() }
@@ -410,10 +627,9 @@ class MainActivity : ComponentActivity() {
         var showSaveDialog by remember { mutableStateOf(false) }
         var saveNameInput by remember { mutableStateOf("") }
         var sequenceToDelete by remember { mutableStateOf<String?>(null) }
-        val context = androidx.compose.ui.platform.LocalContext.current
+        val context = LocalContext.current
         var pendingAction by remember { mutableStateOf<String?>(null) } // "NEW" or a Sequence Name
         var showLoadMenu by remember { mutableStateOf(false) }
-        var savedSequences by remember { mutableStateOf(getAllSavedNames(context)) }
         var curveTension by remember { mutableFloatStateOf(DEFAULT_TENSION) }
         val loadAction = { name: String ->
             val loaded = loadSequence(context, name)
@@ -428,6 +644,7 @@ class MainActivity : ComponentActivity() {
                 onModifiedChange(false)
             }
         }
+
         val resetToNew = {
             // Reset the graph data
             val defaultNodes = listOf(AutomationNode(0f, 1f), AutomationNode(1f, 1f))
@@ -462,36 +679,41 @@ class MainActivity : ComponentActivity() {
 
         // Playback engine
         LaunchedEffect(isPlaying) {
-            if (isPlaying) {
+            if (!isPlaying) {
+                playbackProgress = 0f
+                return@LaunchedEffect
+            }
+
+            try {
                 var lastFrameTime = System.currentTimeMillis()
                 var currentProgress = 0f
 
-                while (isPlaying) {
+                // Use 'isActive' to satisfy the compiler.
+                // It automatically handles the cancellation for you.
+                while (isActive) {
                     val now = System.currentTimeMillis()
                     val deltaTime = (now - lastFrameTime) / 1000f
                     lastFrameTime = now
 
-                    // PROGRESS ADVANCES SLOWER WHEN ZOOMED IN
-                    // (e.g., if zoomFactor is 2.0, delta is halved)
                     val progressDelta = (deltaTime / durationSeconds) / zoomFactor
                     currentProgress += progressDelta
                     playbackProgress = currentProgress.coerceIn(0f, 1f)
 
                     if (playbackProgress >= 1f) {
-                        onTogglePlay(false)
+                        onTogglePlay(false) // This triggers the cancellation
                         break
                     }
 
-                    // MOTOR FREQUENCY IS SCALED BY ZOOM
                     val baseSpeed = calculateSpeedAtTime(playbackProgress, nodes)
                     val actualSpeed = baseSpeed / zoomFactor
+
                     onSpeedUpdate((actualSpeed * 1000).toInt())
 
                     delay(16)
                 }
-            } else {
+            } finally {
+                // This will always run when the loop ends or is canceled
                 playbackProgress = 0f
-                onSpeedUpdate(1000)
             }
         }
 
@@ -511,7 +733,7 @@ class MainActivity : ComponentActivity() {
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
                             val currentTime = System.currentTimeMillis()
-                            var currentSize = getUsableSize(size, zoomFactor)
+                            val currentSize = getUsableSize(size, zoomFactor)
 
                             // 1. Hit Test
                             val hitIndex = nodes.indexOfFirst {
@@ -528,12 +750,23 @@ class MainActivity : ComponentActivity() {
                             var isPanning = false
                             var upEvent: PointerInputChange? = null
 
-                            // If we touched the node that's already yellow, we don't want to wait!
-                            val isInstantDrag = hitIndex != -1 && hitIndex == lastSelectedIndex
+                            var isDraggingNode = false
 
-                            val isLongPress = if (isInstantDrag) {
-                                false // We don't need the timer for an instant drag
+                            val isLongPress = if (hitIndex != -1) {
+                                // If hitting a node, wait to see if we move or hold
+                                withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val change = event.changes.firstOrNull { it.id == down.id }
+                                        if (change == null || !change.pressed) { upEvent = change; break }
+
+                                        val totalDrag = (change.position - down.position).getDistance()
+                                        if (totalDrag > touchSlop) { isDraggingNode = true; break }
+                                        event.changes.forEach { it.consume() }
+                                    }
+                                } == null && !isDraggingNode
                             } else {
+                                // Standard panning/zooming logic for empty space
                                 withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
                                     while (true) {
                                         val event = awaitPointerEvent()
@@ -542,9 +775,7 @@ class MainActivity : ComponentActivity() {
                                         if (change == null || !change.pressed) { upEvent = change; break }
 
                                         val totalDrag = (change.position - down.position).getDistance()
-                                        if (hitIndex == -1 && totalDrag > touchSlop) { isPanning = true; break }
-                                        if (hitIndex != -1 && totalDrag > touchSlop * 5) { isPanning = true; break }
-
+                                        if (totalDrag > touchSlop) { isPanning = true; break }
                                         event.changes.forEach { it.consume() }
                                     }
                                 } == null && !isZooming && !isPanning
@@ -582,7 +813,7 @@ class MainActivity : ComponentActivity() {
                                     panOffset = (panOffset - panChange).coerceIn(0f, maxScroll)
                                     change.consume()
                                 }
-                            } else if ((isLongPress || isInstantDrag) && hitIndex != -1) {
+                            } else if ((isLongPress || isDraggingNode) && hitIndex != -1) {
                                 // --- STABLE DRAG NODE LOOP ---
                                 draggedNodeIndex = hitIndex
                                 haptics.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -676,7 +907,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                 ) {
-                var (usableWidth, usableHeight) = getUsableSize(size, zoomFactor)
+                val (usableWidth, usableHeight) = getUsableSize(size, zoomFactor)
                 val gridColor = Color.White.copy(alpha = 0.15f) // Subtle but visible
 
                 // 2. DRAW HORIZONTAL GRID (Speed)
@@ -718,10 +949,10 @@ class MainActivity : ComponentActivity() {
                 drawBezierPath(automationPath, nodes, Color.Cyan, edgePaddingPx, leftPaddingPx, rightPaddingPx, panOffset,usableWidth, usableHeight, tension = curveTension)
 
                 // Draw Nodes
-                nodes.forEachIndexed { index, _nodes ->
+                nodes.forEachIndexed { index, node ->
                     // USE THE USABLE DIMENSIONS HERE
-                    val centerX = leftPaddingPx - panOffset + (_nodes.timePercent * usableWidth)
-                    val centerY = edgePaddingPx + (1f - (_nodes.speed / 2f)) * usableHeight
+                    val centerX = leftPaddingPx - panOffset + (node.timePercent * usableWidth)
+                    val centerY = edgePaddingPx + (1f - (node.speed / 2f)) * usableHeight
 
                     val isDragging = index == draggedNodeIndex
                     val isLastSelected = index == lastSelectedIndex
@@ -757,8 +988,8 @@ class MainActivity : ComponentActivity() {
                     }
 
                     if (index == lastSelectedIndex || index == draggedNodeIndex) {
-                        val timeValue = _nodes.timePercent * durationSeconds
-                        val label = String.format(Locale.getDefault(), "%.1fs, %.2fHz", timeValue, _nodes.speed)
+                        val timeValue = node.timePercent * durationSeconds
+                        val label = String.format(Locale.getDefault(), "%.1fs, %.2fHz", timeValue, node.speed)
 
                         val horizontalOffset = if (centerX < size.width / 2) 150f else -350f
                         val verticalOffset = if (centerY < 150f) 60f else -100f
@@ -808,8 +1039,11 @@ class MainActivity : ComponentActivity() {
                 ) {
                     if (savedSequences.isEmpty()) {
                         DropdownMenuItem(
-                            text = { Text("No saved sequences", color = Color.Gray) },
-                            onClick = { showLoadMenu = false }
+                            text = { Text("RESTORE FROM FILE", color = Color.Black, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold) },
+                            onClick = {
+                                showLoadMenu = false
+                                importJsonLauncher.launch(arrayOf("application/json"))
+                            }
                         )
                     }
 
@@ -850,7 +1084,29 @@ class MainActivity : ComponentActivity() {
                             }
                         )
                     }
+
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+                    DropdownMenuItem(
+                        text = { Text("RESTORE FROM FILE", color = Color.Black, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold) },
+                        onClick = {
+                            showLoadMenu = false
+                            importJsonLauncher.launch(arrayOf("application/json"))
+                        }
+                    )
+
+                    // Only show Backup if there is actually data to save
+                    if (savedSequences.isNotEmpty()) {
+                        DropdownMenuItem(
+                            text = { Text("BACKUP ALL (JSON)", color = Color.Black, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold) },
+                            onClick = {
+                                showLoadMenu = false
+                                exportJsonLauncher.launch("plinky_plonky_backup.json")
+                            }
+                        )
+                    }
                 }
+
                 IconButton(onClick = {
                     if (isModified) pendingAction = "NEW" else resetToNew()
                 }) {
@@ -974,6 +1230,36 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
+            if (pendingImportData != null) {
+                val conflicts = pendingImportData!!.filter { it.first in savedSequences }.map { it.first }
+
+                AlertDialog(
+                    onDismissRequest = { pendingImportData = null },
+                    title = { Text("Import Conflicts") },
+                    text = {
+                        Text("The following sequences already exist:\n\n${conflicts.joinToString(", ")}\n\nDo you want to overwrite them or skip the duplicates?")
+                    },
+                    confirmButton = {
+                        Button(onClick = {
+                            pendingImportData?.forEach { (name, nodes, params) ->
+                                saveSequence(context, name, nodes, params.first, params.second)
+                            }
+                            savedSequences = getAllSavedNames(context)
+                            pendingImportData = null
+                        }) { Text("Overwrite All") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = {
+                            pendingImportData?.filter { it.first !in savedSequences }?.forEach { (name, nodes, params) ->
+                                saveSequence(context, name, nodes, params.first, params.second)
+                            }
+                            savedSequences = getAllSavedNames(context)
+                            pendingImportData = null
+                        }) { Text("Skip Duplicates") }
+                    }
+                )
+            }
+
             Surface(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -1045,6 +1331,7 @@ class MainActivity : ComponentActivity() {
                                     value = curveTension,
                                     onValueChange = {
                                         // Haptic pulse when hitting limit
+                                        @Suppress("ReplaceTwoComparisonWithRangeCheck")
                                         if ((it >= MAX_TENSION && curveTension < MAX_TENSION) || (it <= MIN_TENSION && curveTension > MIN_TENSION)) {
                                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                         }
@@ -1095,33 +1382,45 @@ class MainActivity : ComponentActivity() {
         status: String,
         onScan: () -> Unit,
         onTogglePlay: (Boolean) -> Unit,
-        onUpdateSpeed: (Int) -> Unit
+        onSpeedUpdate: (Int) -> Unit,
+        lastUserTouchTime: Long,
+        onUpdateTouchTime: (Long) -> Unit
     ) {
-        // Timestamped user interactions to avoid race conditions with HW
-        var lastUserTouchTime by remember { mutableLongStateOf(0L) }
-
         // State
-        var knobValue by remember { mutableFloatStateOf(currentSpeed / 1000f) }
         val haptics = LocalHapticFeedback.current
+        val configuration = androidx.compose.ui.platform.LocalConfiguration.current
 
         // Hardware sync
         LaunchedEffect(currentSpeed) {
             val timeSinceTouch = System.currentTimeMillis() - lastUserTouchTime
-            // Only let the hardware override the UI if the user hasn't touched it
-            // in the last 1000ms (1 second)
-            if (timeSinceTouch > 1000) {
+
+            // ONLY sync the knob to the hardware if:
+            // 1. The user hasn't touched the knob in the last second
+            // 2. The motor is NOT currently playing
+            // 3. There is a valid speed value
+            if (timeSinceTouch > 1000 && !isPlaying && currentSpeed >= 0) {
                 knobValue = currentSpeed / 1000f
             }
         }
 
         // Debounce
         LaunchedEffect(knobValue) {
-            delay(300)
-            val speedToSend = (knobValue * 1000).toUInt().toInt()
-            onUpdateSpeed(speedToSend)
-
-            if (knobValue == 0f && isPlaying) {
-                writeBoolean(PLAY_STOP_UUID, false)
+            // ONLY run this logic if we are NOT in landscape.
+            // This stops the 'Portrait' logic from shouting over the 'Landscape' logic.
+            if (configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) {
+                delay(300)
+                onSpeedUpdate((knobValue * 1000).toInt())
+                if (isPlayEnabled) {
+                    if (knobValue < 0.01f && isPlaying) {
+                        // Master is ON, but knob is at 0: Soft Stop
+                        this@MainActivity.isPlaying = false
+                        this@MainActivity.enqueueBoolean(PLAY_STOP_UUID, false)
+                    } else if (knobValue >= 0.01f && !isPlaying) {
+                        // Master is ON, and knob moved away from 0: Resume
+                        this@MainActivity.isPlaying = true
+                        enqueueBoolean(PLAY_STOP_UUID, true)
+                    }
+                }
             }
         }
 
@@ -1143,7 +1442,6 @@ class MainActivity : ComponentActivity() {
                 }
             } else {
                 // Use a tiny epsilon check (0.01) instead of an exact 0f
-                val isEffectivelyStopped = !isPlaying || knobValue < 0.01f
                 Spacer(modifier = Modifier.height(32.dp))
 
                 Column(
@@ -1166,7 +1464,7 @@ class MainActivity : ComponentActivity() {
                         value = knobValue,
                         onValueChange = { newValue ->
                             // Update the interaction timer
-                            lastUserTouchTime = System.currentTimeMillis()
+                            onUpdateTouchTime(System.currentTimeMillis())
 
                             // Update the state
                             knobValue = newValue
@@ -1178,17 +1476,16 @@ class MainActivity : ComponentActivity() {
                     Button(
                         modifier = Modifier.fillMaxWidth(0.6f),
                         onClick = {
-                            lastUserTouchTime = System.currentTimeMillis() // LOCK the sync
+                            onUpdateTouchTime(System.currentTimeMillis())
                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                            if (isEffectivelyStopped) {
-                                if (knobValue < 0.01f) knobValue = 0.1f
-                                onTogglePlay(true)
-                            } else {
-                                onTogglePlay(false)
-                            }
+                            // Toggle the Master Switch
+                            onTogglePlay(!isPlayEnabled)
                         }) {
-                        // This will toggle to "PLAY" when knobValue hits 0.0
-                        Text(if (isEffectivelyStopped) "PLAY" else "STOP")
+                        val buttonText = when {
+                            !isPlayEnabled -> "PLAY"            // Master is OFF
+                            else -> "STOP"                      // Master is ON and running
+                        }
+                        Text(buttonText)
                     }
                 }
             }
@@ -1241,42 +1538,24 @@ class MainActivity : ComponentActivity() {
         scanner?.startScan(null, settings, callback)
     }
 
-    // Helper: Write 1 byte (Boolean)
-    private fun writeBoolean(charUuid: UUID, value: Boolean) {
-        val service = activeGatt?.getService(SERVICE_UUID)
-        val char = service?.getCharacteristic(charUuid)
-        if (char != null) {
-            val bytes = if (value) byteArrayOf(0x01) else byteArrayOf(0x00)
-            activeGatt?.writeCharacteristic(char, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-        }
+    private fun enqueueBoolean(charUuid: UUID, value: Boolean) {
+        val bytes = if (value) listOf<Byte>(0x01) else listOf<Byte>(0x00)
+        commandQueue.trySend(BleCommand(charUuid, bytes))
     }
 
-    // Helper: Write 4 bytes (Int32 Little Endian)
-    private fun writeInt32(charUuid: UUID, value: Int) {
-        // If it's a speed update and the sequence has ended/stopped, block the write
-        if (charUuid == SPEED_UUID && !isPlaying) {
-            Log.d("BLE_DEBUG", "Blocked speed write because motor is STOPPED")
-            return
-        }
-        val gatt = activeGatt ?: return
-        val service = gatt.getService(SERVICE_UUID) ?: return
-        val char = service.getCharacteristic(charUuid) ?: return
-
-        // Ensure we aren't overwhelming the radio
-        char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        val bytes = byteArrayOf(
-            (value and 0xFF).toByte(),
-            ((value shr 8) and 0xFF).toByte(),
-            ((value shr 16) and 0xFF).toByte(),
-            ((value shr 24) and 0xFF).toByte()
-        )
-
-        if (isConnected) {
-            try {
-                gatt.writeCharacteristic(char, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-            } catch (e: Exception) {
-                Log.e("BLE_ERROR", "Write failed: ${e.message}")
-            }
+    private fun enqueueInt32(charUuid: UUID, value: Int) {
+        if (charUuid == SPEED_UUID) {
+            // Send to the conflated channel so we don't flood the BLE stack
+            speedChannel.trySend(value)
+        } else {
+            // For any other Int32 chars (if added later), use the standard queue
+            val bytes = listOf(
+                (value and 0xFF).toByte(),
+                ((value shr 8) and 0xFF).toByte(),
+                ((value shr 16) and 0xFF).toByte(),
+                ((value shr 24) and 0xFF).toByte()
+            )
+            commandQueue.trySend(BleCommand(charUuid, bytes))
         }
     }
 
@@ -1312,11 +1591,11 @@ class MainActivity : ComponentActivity() {
         // Convert the list of nodes into a string
         val encodedNodes = nodes.joinToString("|") { String.format(Locale.getDefault(), "%.3f", it.timePercent) + ",${it.speed}"}
 
-        prefs.edit()
-            .putString("nodes_$name", encodedNodes)
-            .putFloat("dur_$name", duration)
-            .putFloat("tension_$name", tension)
-            .apply()
+        prefs.edit {
+            putString("nodes_$name", encodedNodes)
+                .putFloat("dur_$name", duration)
+                .putFloat("tension_$name", tension)
+        }
     }
 
     private fun getAllSavedNames(context: android.content.Context): List<String> {
@@ -1340,11 +1619,11 @@ class MainActivity : ComponentActivity() {
 
     private fun deleteSequence(context: android.content.Context, name: String) {
         val prefs = context.getSharedPreferences("PlinkyPlonkySequences", MODE_PRIVATE)
-        prefs.edit()
-            .remove("nodes_$name")
-            .remove("dur_$name")
-            .remove("tension_$name")
-            .apply()
+        prefs.edit {
+            remove("nodes_$name")
+                .remove("dur_$name")
+                .remove("tension_$name")
+            }
     }
 }
 
@@ -1469,7 +1748,7 @@ fun DrawScope.drawBezierPath(
     color: Color,
     padding: Float,
     leftPadding: Float,
-    rightPadding: Float,
+    @Suppress("UNUSED_PARAMETER") rightPadding: Float,
     panOffset: Float,
     uWidth: Float,
     uHeight: Float,
@@ -1478,19 +1757,19 @@ fun DrawScope.drawBezierPath(
     if (nodes.size < 2) return
     path.reset()
 
-    fun getCoord(node: AutomationNode): Offset {
+    fun getCoordinate(node: AutomationNode): Offset {
         return Offset(
             leftPadding - panOffset + (node.timePercent * uWidth),
             padding + (1f - (node.speed / 2f)) * uHeight
         )
     }
 
-    val startPoint = getCoord(nodes[0])
+    val startPoint = getCoordinate(nodes[0])
     path.moveTo(startPoint.x, startPoint.y)
 
     for (i in 0 until nodes.size - 1) {
-        val p0 = getCoord(nodes[i])
-        val p1 = getCoord(nodes[i + 1])
+        val p0 = getCoordinate(nodes[i])
+        val p1 = getCoordinate(nodes[i + 1])
 
         // The closer 'tension' is to a high number, the straighter the line.
         // 2.0f is a smooth standard curve. 10.0f is almost a straight line.
