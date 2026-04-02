@@ -258,6 +258,9 @@ esp_err_t tmc2209_set_velocity(int32_t address,
 /** Get the velocity of the stepper motor attached to a
  * TMC2209 device.
  *
+ * Note: will not return a valid value until
+ * tmc2209_set_velocity() has been called at least once.
+ *
  * Note: this returns the velocity at a microstep resolution
  * of 1: if you have set a greater microstep resolution
  * (e.g. 256) then, to get the specified rotation rate

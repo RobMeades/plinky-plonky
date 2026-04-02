@@ -311,6 +311,7 @@ static int32_t velocity_change(int32_t target_speed_millihertz)
             }
         }
         err = tmc2209_set_velocity(TMC2209_ADDRESS, velocity);
+        ESP_LOGI(TAG, "BLE tmc2209_set_velocity for velocity %d returned %d.", velocity, err);
         if ((err >= 0) && (velocity != target_velocity)) {
             vTaskDelay(pdMS_TO_TICKS(STEPPER_MOTOR_SPEED_MILLIHERTZ_CHANGE_INTERVAL_MS));
         }

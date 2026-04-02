@@ -76,9 +76,9 @@ static gpio_num_t g_pin_motor_enable[MAX_NUM_TMC2209];
 // register i.e. 256 is an MRES value of 0, 1 is an MRES value of 8.
 static const int32_t g_microstep_table[] = {256, 128, 64, 32, 16, 8, 4, 2, 1};
 
-// The VACTUAL register is write-only so keep a shadow of it
-// for the purposes of tmc2209_get_velocity().
-static int32_t g_vactual = 0;
+// The VACTUAL register is write-only so keep a shadow of
+// the speed in milliHertz to pass back to tmc2209_get_velocity().
+static int32_t g_speed_milliHertz = 0;
 
 /* ----------------------------------------------------------------
  * STATIC FUNCTIONS
@@ -682,14 +682,13 @@ esp_err_t tmc2209_unset_current(int32_t address)
 esp_err_t tmc2209_set_velocity(int32_t address,
                                int32_t milliHertz)
 {
-    milliHertz *= 1000;
-    milliHertz /= VACTUAL_TO_MICROHERTZ;
+    int32_t vactual = (milliHertz * 1000) / VACTUAL_TO_MICROHERTZ;
 
     // Write to the VACTUAL register (0x22)
-    esp_err_t err = write_reg(address, 0x22, milliHertz);
+    esp_err_t err = write_reg(address, 0x22, vactual);
 
     if (err == ESP_OK) {
-        g_vactual = milliHertz;
+        g_speed_milliHertz = milliHertz;
     }
 
     return err;
@@ -704,7 +703,7 @@ esp_err_t tmc2209_get_velocity(int32_t address,
 
     // The VACTUAL register is write-only so return the shadow
     if (milliHertz) {
-        *milliHertz = g_vactual;
+        *milliHertz = g_speed_milliHertz;
         err = ESP_OK;
     }
 
