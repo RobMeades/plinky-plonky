@@ -51,7 +51,7 @@
 // From the table in section 14 of the TMC2209 datasheet,
 // the number to multiply VACTUAL by to get a step frequency
 // in microHertz
-#define VACTUAL_TO_MICROHERTZ (715 * 1000 / 256 / 2)
+#define VACTUAL_TO_MICROHERTZ (715 * 1000 / 256)
 
 // The maximum value of IRUN or IHOLD, which are 5-bit values.
 #define IRUN_OR_IHOLD_MAX 31
