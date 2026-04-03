@@ -16,8 +16,20 @@
 
 /* This written by Google Gemini from my prompts, over several days
  * with several arguments/disagreements and not a few regressions
- * and "imaginative" outcomes along the way.  It still emits warnings.
- * but I dare not touch it: good enough is good enough. */
+ * and "imaginative" outcomes along the way.  Some hints for future
+ * Rob to avoid datoius and very long nights:
+ *
+ * - if you ask a general question, check, check and check the
+ *   answer,
+ * - if you provide a large amount of text as a basis for a
+ *   question (e.g. a source file), same: beware hallucinations,
+ * - if offered an assertion about code behaviour and you
+ *   have the slightest sniff of doubt, ask for a version
+ *   of code that only has debug added to it and provide
+ *   that debug back as evidence: debug is usually
+ *   smaller and more focussed, dampens hallucinations.
+ *
+ * */
 
 package org.meades.plinky_plonky
 
@@ -88,6 +100,10 @@ import kotlin.math.cos
 import kotlin.math.pow
 import kotlin.math.sin
 import androidx.core.content.edit
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.withTimeout
 
 // Global Configuration
 const val DEFAULT_TENSION = 4f
@@ -139,7 +155,14 @@ fun PermissionRequester(onGranted: () -> Unit) {
 class MainActivity : ComponentActivity() {
 
     private var bluetoothAdapter: BluetoothAdapter? = null
-    data class BleCommand(val uuid: UUID, val data: List<Byte>)
+    sealed class BleOperation {
+        data class Read(val uuid: UUID) : BleOperation()
+        data class Write(
+            val uuid: UUID,
+            val values: List<Byte>,
+            val writeType: Int = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        ) : BleOperation()
+    }
     var isPlaying by mutableStateOf(false)
     var currentSpeed by mutableIntStateOf(-1)
     // We use 'val' because the List Object (the buffer) never changes, only its contents.
@@ -152,73 +175,157 @@ class MainActivity : ComponentActivity() {
     var originalDuration by mutableFloatStateOf(DEFAULT_DURATION)
     var savedSequences by mutableStateOf(listOf<String>())
     var pendingImportData by mutableStateOf<List<Triple<String, List<AutomationNode>, Pair<Float, Float>>>?>(null)
-    var knobValue by mutableFloatStateOf(SPEED_MAX_HERTZ / 2)
     var isPlayEnabled by mutableStateOf(false)
-    // Timestamped user interactions to avoid race conditions with HW
-    var lastUserTouchTime by mutableLongStateOf(0)
 
-    // Keep track of the active connection
-    private var activeGatt: BluetoothGatt? = null
-    private var isConnected by mutableStateOf(false)
+    // Keep these in a companion object so that they are not
+    // destroyed on transitioning between portrait and landscape
+    companion object {
+        var activeGatt: BluetoothGatt? = null
+        var isConnected by mutableStateOf(false)
+        var isWorkerRunning = false
+        var knobValue by mutableFloatStateOf(SPEED_MAX_HERTZ / 2)
+        var hasPerformedInitialSync = false
 
-    // Command queue as BLE writes in Android are asynchronous and
-    // will silently lose commands that arrive too quickly
-    private val commandQueue = kotlinx.coroutines.channels.Channel<BleCommand>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        @Volatile
+        var workerSilenced: Boolean = false
+    }
+
+    // It is difficult to believe but apparently
+    // the BLE interface on Android is single-threaded,
+    // hence we need a queue to feed it
+    private val operationChannel = Channel<BleOperation>(Channel.RENDEZVOUS)
+
+    // Helpers to push to the queue
+    // For Booleans (Start/Stop)
+    private fun enqueue(uuid: UUID, value: Boolean) {
+        val byteValue = if (value) 0x01.toByte() else 0x00.toByte()
+        enqueue(BleOperation.Write(uuid, listOf(byteValue)))
+    }
+
+    // For Int32 (Speed updates)
+    private fun enqueue(uuid: UUID, value: Int) {
+        val bytes = listOf(
+            (value and 0xFF).toByte(),
+            ((value shr 8) and 0xFF).toByte(),
+            ((value shr 16) and 0xFF).toByte(),
+            ((value shr 24) and 0xFF).toByte()
+        )
+        enqueue(BleOperation.Write(uuid, bytes))
+    }
+
+    // For Reads (Simple UUID)
+    private fun enqueue(uuid: UUID) {
+        enqueue(BleOperation.Read(uuid))
+    }
+
+    // For Fast Speed updates (No Response / Fire-and-Forget)
+    private fun enqueueNoResponse(uuid: UUID, value: Int) {
+        val bytes = listOf(
+            (value and 0xFF).toByte(),
+            ((value shr 8) and 0xFF).toByte(),
+            ((value shr 16) and 0xFF).toByte(),
+            ((value shr 24) and 0xFF).toByte()
+        )
+        // We pass WRITE_TYPE_NO_RESPONSE here
+        enqueue(BleOperation.Write(uuid, bytes, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE))
+    }
+    // The core "Private" sender
+    private fun enqueue(op: BleOperation) {
+        lifecycleScope.launch {
+            operationChannel.send(op)
+        }
+    }
+
     private val bleMutex = kotlinx.coroutines.sync.Mutex()
-    private var completionDeferred: kotlinx.coroutines.CompletableDeferred<Int>? = null
+    private var completionDeferred: CompletableDeferred<Int>? = null
     // A conflated channel only keeps the LATEST value, dropping older ones automatically
-    private val speedChannel = kotlinx.coroutines.channels.Channel<Int>(kotlinx.coroutines.channels.Channel.CONFLATED)
 
     private fun hasRequiredPermissions(): Boolean {
         val perms = arrayOf(android.Manifest.permission.BLUETOOTH_SCAN, android.Manifest.permission.BLUETOOTH_CONNECT)
         return perms.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
     }
 
-    // The serialized write execution
-    private suspend fun executeSafeWrite(charUuid: UUID, bytes: List<Byte>): Boolean {
-        val gatt = activeGatt ?: return false
-        val char = gatt.getService(SERVICE_UUID)?.getCharacteristic(charUuid) ?: return false
-
+    // The serialized BLE execution
+    private suspend fun executeSafeOperation(
+        op: BleOperation,
+        characteristic: BluetoothGattCharacteristic,
+        gatt: BluetoothGatt
+    ): Boolean {
         return bleMutex.withLock {
-            completionDeferred = kotlinx.coroutines.CompletableDeferred()
+            // 1. Prepare the "Signal" that we are waiting for a response
+            completionDeferred = CompletableDeferred()
 
-            // Use the new Android 13+ compatible write
-            gatt.writeCharacteristic(char, bytes.toByteArray(), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-
-            // Wait up to 500ms for hardware to say "Got it"
-            withContext(kotlinx.coroutines.Dispatchers.IO) {
-                try {
-                    kotlinx.coroutines.withTimeout(500) {
-                        completionDeferred?.await() == BluetoothGatt.GATT_SUCCESS
+            try {
+                when (op) {
+                    is BleOperation.Read -> {
+                        Log.d("BLE_DEBUG", "LOCK: Acquired for READ ${op.uuid}")
+                        gatt.readCharacteristic(characteristic)
                     }
-                } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
-                    Log.e("BLE_DEBUG", "Write Timeout for $charUuid")
-                    false
+                    is BleOperation.Write -> {
+                        Log.d("BLE_DEBUG", "LOCK: Acquired for WRITE ${op.uuid}")
+                        // Use the writeType stored in the operation (Default vs NoResponse)
+                        gatt.writeCharacteristic(
+                            characteristic,
+                            op.values.toByteArray(),
+                            op.writeType
+                        )
+
+                        // If we aren't expecting a response,
+                        // tell the worker to proceed immediately.
+                        if (op.writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
+                            completionDeferred?.complete(0)
+                        }
+                    }
                 }
+
+                // 2. The "Wait": This suspends the worker until the callback calls .complete()
+                // We use a timeout so a lost packet doesn't hang the whole app forever.
+                withTimeout(1500) {
+                    completionDeferred?.await()
+                }
+                true
+            } catch (e: Exception) {
+                Log.e("BLE_DEBUG", "Operation Error on ${characteristic.uuid}: ${e.message}")
+                false
+            } finally {
+                // Cleanup to prevent memory leaks or stale signals
+                completionDeferred = null
             }
         }
     }
 
-    // Start BLE command queu processor
-    private fun startBleWorker() {
-        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            for (command in commandQueue) {
-                Log.d("BLE_DEBUG", "Writing command: $command")
-                executeSafeWrite(command.uuid, command.data)
-            }
-        }
-        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            for (speedValue in speedChannel) {
-                // Convert Int to 4-byte array (Little Endian)
-                val bytes = listOf(
-                    (speedValue and 0xFF).toByte(),
-                    ((speedValue shr 8) and 0xFF).toByte(),
-                    ((speedValue shr 16) and 0xFF).toByte(),
-                    ((speedValue shr 24) and 0xFF).toByte()
-                )
-                // Use the same mutex-protected write to avoid collisions
-                Log.d("BLE_DEBUG", "Writing speed: $speedValue")
-                executeSafeWrite(SPEED_UUID, bytes)
+    // Start BLE command queue processor
+    private fun startBleWorker(gatt: BluetoothGatt) {
+        // Only one loop needed now
+        if (isWorkerRunning) return
+        isWorkerRunning = true
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            Log.i("BLE_DEBUG", "WORKER: Unified Loop Started.")
+            try {
+                // This pulls BOTH reads and writes in the order they were enqueued
+                for (op in operationChannel) {
+                    if (workerSilenced) continue
+
+                    val uuid = when (op) {
+                        is BleOperation.Read -> op.uuid
+                        is BleOperation.Write -> op.uuid
+                    }
+
+                    val characteristic = gatt.getService(SERVICE_UUID)?.getCharacteristic(uuid)
+                    if (characteristic == null) {
+                        Log.e("BLE_DEBUG", "WORKER: Characteristic $uuid not found.")
+                        continue
+                    }
+
+                    // Reuse your existing logic but inside the unified flow
+                    executeSafeOperation(op, characteristic, gatt)
+                }
+            } catch (e: Exception) {
+                Log.e("BLE_DEBUG", "WORKER: Fatal crash in loop: ${e.message}")
+            } finally {
+                Log.e("BLE_DEBUG", "WORKER: Loop exited! BLE communication is now DEAD.")
+                isWorkerRunning = false
             }
         }
     }
@@ -227,7 +334,7 @@ class MainActivity : ComponentActivity() {
         // We only send this if we are actually connected
         if (isConnected) {
             // This puts the STOP command at the end of the queue
-            enqueueBoolean(PLAY_STOP_UUID, false)
+            enqueue(PLAY_STOP_UUID, false)
             Log.d("BLE_DEBUG", "Stop command queued for exit.")
         }
     }
@@ -266,9 +373,23 @@ class MainActivity : ComponentActivity() {
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    Log.d("BLE_DEBUG", "Services found. Starting Initial Read...")
-                    // Start the chain: Read the Play/Stop status first
-                    readCharacteristic(PLAY_STOP_UUID)
+                    Log.i("BLE_DEBUG", "Services Discovered. Starting Worker...")
+
+                    // Request a high priority connection
+                    gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+
+                    // Update our global reference
+                    activeGatt = gatt
+
+                    // 1. Start the worker with the freshly discovered GATT
+                    startBleWorker(gatt)
+
+                    // 2. Perform your initial state sync
+                    // These go into the queue and wait for the worker to process them
+                    enqueue(PLAY_STOP_UUID)
+                    enqueue(SPEED_UUID)
+                } else {
+                    Log.e("BLE_DEBUG", "Service discovery failed with status: $status")
                 }
             }
 
@@ -282,9 +403,7 @@ class MainActivity : ComponentActivity() {
                     when (characteristic.uuid) {
                         PLAY_STOP_UUID -> {
                             isPlaying = value.getOrNull(0) == 0x01.toByte()
-                            Log.d("BLE_DEBUG", "Read PlayState: $isPlaying. Next: Read Speed.")
-                            // Chain the next read
-                            readCharacteristic(SPEED_UUID)
+                            Log.d("BLE_DEBUG", "Read PlayState: $isPlaying.")
                         }
                         SPEED_UUID -> {
                             // Convert 4 bytes (Little Endian) to Int
@@ -295,17 +414,20 @@ class MainActivity : ComponentActivity() {
                                         ((value[3].toInt() and 0xFF) shl 24)
                             } else -1
 
-                            Log.d("BLE_DEBUG", "Read Speed: $currentSpeed. UI Synced.")
+                            Log.d("BLE_DEBUG", "Read Speed: $currentSpeed.")
                             runOnUiThread {
                                 // Sync the UI knob to the hardware immediately on connection
-                                if (currentSpeed >= 0) {
+                                if ((currentSpeed >= 0) && !hasPerformedInitialSync) {
                                     knobValue = currentSpeed / 1000f
+                                    hasPerformedInitialSync = true
+                                    Log.i("BLE_DEBUG", "START_OF_DAY: One-time knob sync complete.")
                                 }
                                 isConnected = true
                             }
                         }
                     }
                 }
+                completionDeferred?.complete(status)
             }
 
             override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
@@ -327,15 +449,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Helper function to trigger a read
-    private fun readCharacteristic(uuid: UUID) {
-        val service = activeGatt?.getService(SERVICE_UUID)
-        val char = service?.getCharacteristic(uuid)
-        if (char != null) {
-            activeGatt?.readCharacteristic(char)
-        }
-    }
-
     private val exportJsonLauncher = registerForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
         uri?.let { saveJsonToUri(it) }
     }
@@ -345,7 +458,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveJsonToUri(uri: android.net.Uri) {
-        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val allNames = getAllSavedNames(this@MainActivity)
                 val rootArray = JSONArray()
@@ -376,7 +489,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadJsonFromUri(uri: android.net.Uri) {
-        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        lifecycleScope.launch(Dispatchers.IO) {
             try {
                 // 1. Read the file from disk (Background Thread)
                 val jsonString = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: return@launch
@@ -402,7 +515,7 @@ class MainActivity : ComponentActivity() {
                 }
 
                 // 2. Process results on the UI Thread (Main Thread)
-                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                withContext(Dispatchers.Main) {
                     val existingNames = getAllSavedNames(this@MainActivity)
                     val conflicts = tempList.map { it.first }.filter { it in existingNames }
 
@@ -424,7 +537,7 @@ class MainActivity : ComponentActivity() {
                 }
             } catch (e: Exception) {
                 Log.e("IMPORT", "Failed to import JSON", e)
-                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                withContext(Dispatchers.Main) {
                     android.widget.Toast.makeText(this@MainActivity,
                         "Import failed: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
                 }
@@ -449,20 +562,21 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Log.i("KNOB_DEBUG", "LIFECYCLE: onCreate. Current knobValue in companion is: $knobValue")
         setContent {
             val permissionsGranted = remember { mutableStateOf(hasRequiredPermissions()) }
             if (permissionsGranted.value) {
-                // This code only runs when permissions are 100% granted.
                 LaunchedEffect(Unit) {
-                    // NOW it is safe to touch the system services
+                    val runId = (1000..9999).random()
+                    Log.i("BLE_DEBUG", "LAUNCH_ID [$runId]: Effect Started.")
+
+                    // 1. Get Adapter
                     val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
                     bluetoothAdapter = manager.adapter
+                    Log.d("BLE_DEBUG", "LAUNCH_ID [$runId]: Adapter initialized.")
 
-                    // Start the background  BLE processor
-                    startBleWorker()
-
-                    //  Seamlessly try to find the device
-                    // the moment the "Waiting" screen disappears
+                    // 3. Connect
+                    Log.d("BLE_DEBUG", "LAUNCH_ID [$runId]: Calling autoConnect...")
                     autoConnect()
                 }
 
@@ -476,7 +590,7 @@ class MainActivity : ComponentActivity() {
                     // Rotated: ensure the motor is OFF
                     // to avoid any surprises
                     isPlaying = false
-                    enqueueBoolean(PLAY_STOP_UUID, false)
+                    enqueue(PLAY_STOP_UUID, false)
                     if (!isLandscape) {
                         isPlayEnabled = false
                     }
@@ -487,22 +601,22 @@ class MainActivity : ComponentActivity() {
                     // read the current speed first so that it
                     // is not stale when we switch back to
                     // Portrait mode
-                    readCharacteristic(SPEED_UUID)
+                    //readCharacteristic(SPEED_UUID)
                     LandscapeSequencer(
                         isPlaying = isPlaying, // Passes the Activity state DOWN
                         onTogglePlay = { requestedState ->
+                            Log.i("KNOB_DEBUG", "LANDSCAPE_UI: TogglePlay requested -> $requestedState")
                             isPlaying = requestedState
 
                             if (requestedState) {
-                                // Just start; the sequencer loop handles the speed updates
-                                enqueueBoolean(PLAY_STOP_UUID, true)
+                                enqueue(PLAY_STOP_UUID, true)
                             } else {
-                                // Stop and clear the speed queue
-                                while(speedChannel.tryReceive().isSuccess) { /* drain */ }
-                                enqueueBoolean(PLAY_STOP_UUID, false)
+                                Log.d("KNOB_DEBUG", "LANDSCAPE_UI: sending STOP")
+                                // TODO: we used to drain the speed channel here - is it necessary?
+                                enqueue(PLAY_STOP_UUID, false)
                             }
                         },
-                        onSpeedUpdate = { enqueueInt32(SPEED_UUID, it) },
+                        onSpeedUpdate = { enqueueNoResponse(SPEED_UUID,it) },
                         nodes = nodes, // Pass the current value
                         onNodesChange = { newNodes ->
                             nodes.clear()
@@ -521,7 +635,6 @@ class MainActivity : ComponentActivity() {
                 } else {
                     PortraitController(
                         isConnected = isConnected,
-                        isPlaying = isPlaying,
                         currentSpeed = currentSpeed,
                         status = status,
                         onScan = {
@@ -544,17 +657,15 @@ class MainActivity : ComponentActivity() {
 
                             if (requestedState) {
                                 isPlaying = true
-                                enqueueInt32(SPEED_UUID, (knobValue * 1000).toInt())
-                                enqueueBoolean(PLAY_STOP_UUID, true)
+                                enqueue(SPEED_UUID, (knobValue * 1000).toInt())
+                                enqueue(PLAY_STOP_UUID, true)
                             } else {
                                 isPlaying = false
-                                while(speedChannel.tryReceive().isSuccess) { /* Drain queue */ }
-                                enqueueBoolean(PLAY_STOP_UUID, false)
+                                // TODO: we used to drain the speed channel here - is it necessary?
+                                enqueue(PLAY_STOP_UUID, false)
                             }
                         },
-                        onSpeedUpdate = { enqueueInt32(SPEED_UUID, it) },
-                        lastUserTouchTime = lastUserTouchTime,
-                        onUpdateTouchTime = { lastUserTouchTime = it }
+                        onSpeedUpdate = { enqueue(SPEED_UUID, it) },
                     )
                 }
             } else {
@@ -566,24 +677,58 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val orient = if (newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE) "LANDSCAPE" else "PORTRAIT"
+        Log.i("BLE_DEBUG", "LIFECYCLE: Rotation to $orient. isWorkerRunning is $isWorkerRunning")
+        sendStopCommand()
+    }
+
+    override fun onPause() {
+        // Silence the motor during the split-second layout shift
+        Log.d("BLE_DEBUG", "LIFECYCLE: onPause - Silencing workers")
+        workerSilenced = true
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        Log.d("BLE_DEBUG", "LIFECYCLE: onResume - Unsilencing workers")
+        workerSilenced = false
+    }
+
     override fun onDestroy() {
-        // Send the stop command immediately (synchronous)
+        Log.i("BLE_DEBUG", "LIFECYCLE: onDestroy - App being closed permanently")
+
+        // 1. Kill the loop flag
+        workerSilenced = true
+        isWorkerRunning = false
+
+        // 2. Emergency Stop
         if (isConnected) {
-            Log.d("BLE_DEBUG", "onDestroy: Sending final stop command")
-            sendStopCommand()
+            val gatt = activeGatt
+            val char = gatt?.getService(SERVICE_UUID)?.getCharacteristic(PLAY_STOP_UUID)
+            if (gatt != null && char != null) {
+                try {
+                    Log.d("BLE_DEBUG", "onDestroy: Sending final Stop Command")
+                    gatt.writeCharacteristic(char, byteArrayOf(0x00), BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                    Thread.sleep(180) // Give hardware a moment to process before we kill the link
+                } catch (e: Exception) {
+                    Log.e("BLE_DEBUG", "onDestroy: Stop failed: ${e.message}")
+                }
+            }
         }
 
-        // We want to disconnect NOW so the hardware sees the link drop
-        // after the stop command is buffered.
+        // 3. Close the connection
         try {
-            activeGatt?.let { gatt ->
-                gatt.disconnect()
-                gatt.close()
-            }
+            activeGatt?.disconnect()
+            activeGatt?.close()
             activeGatt = null
             isConnected = false
-            Log.d("BLE_DEBUG", "onDestroy: Resources released synchronously.")
-        } catch (_: SecurityException) { }
+            Log.d("BLE_DEBUG", "onDestroy: Bluetooth cleaned up")
+        } catch (e: Exception) {
+            Log.e("BLE_DEBUG", "onDestroy: Cleanup error: ${e.message}")
+        }
 
         super.onDestroy()
     }
@@ -608,37 +753,6 @@ class MainActivity : ComponentActivity() {
                 BluetoothDevice.TRANSPORT_LE
             )
         }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        // If we return and find we are disconnected, try to find our device again
-        if (!isConnected) {
-            autoConnect()
-        }
-    }
-
-    override fun onStop() {
-        super.onStop()
-
-        // 1. Try to send the stop command immediately
-        if (isConnected) {
-            sendStopCommand()
-        }
-
-        // 2. We need a tiny delay to let the BLE hardware actually transmit
-        // the "Stop" packet before we kill the GATT connection.
-        // 50ms is usually enough for one final packet.
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            try {
-                activeGatt?.disconnect()
-                activeGatt?.close()
-                activeGatt = null
-                isConnected = false
-            } catch (_: SecurityException) {
-                // Ignore
-            }
-        }, 100) // 100ms delay for a clean break
     }
 
     @Composable
@@ -696,7 +810,7 @@ class MainActivity : ComponentActivity() {
 
         val resetToNew = {
             // Reset the graph data
-            val defaultNodes = listOf(AutomationNode(0f, 1f), AutomationNode(1f, 1f))
+            val defaultNodes = listOf(AutomationNode(0f, SPEED_MAX_HERTZ), AutomationNode(1f, SPEED_MAX_HERTZ))
             nodes.clear()
             nodes.addAll(defaultNodes)
             onOriginalNodesChange(defaultNodes) // Set the new "baseline" to the default
@@ -749,7 +863,7 @@ class MainActivity : ComponentActivity() {
                     playbackProgress = currentProgress.coerceIn(0f, 1f)
 
                     if (playbackProgress >= 1f) {
-                        onTogglePlay(false) // This triggers the cancellation
+                        onTogglePlay(false)
                         break
                     }
 
@@ -758,7 +872,7 @@ class MainActivity : ComponentActivity() {
 
                     onSpeedUpdate((actualSpeed * 1000).toInt())
 
-                    delay(16)
+                    delay(50)
                 }
             } finally {
                 // This will always run when the loop ends or is canceled
@@ -1416,49 +1530,35 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun PortraitController(
         isConnected: Boolean,
-        isPlaying: Boolean,
         currentSpeed: Int,
         status: String,
         onScan: () -> Unit,
         onTogglePlay: (Boolean) -> Unit,
         onSpeedUpdate: (Int) -> Unit,
-        lastUserTouchTime: Long,
-        onUpdateTouchTime: (Long) -> Unit
     ) {
-        // State
         val haptics = LocalHapticFeedback.current
         val configuration = androidx.compose.ui.platform.LocalConfiguration.current
 
-        // Hardware sync
-        LaunchedEffect(currentSpeed) {
-            val timeSinceTouch = System.currentTimeMillis() - lastUserTouchTime
-
-            // ONLY sync the knob to the hardware if:
-            // 1. The user hasn't touched the knob in the last second
-            // 2. The motor is NOT currently playing
-            // 3. There is a valid speed value
-            if (timeSinceTouch > 1000 && !isPlaying && currentSpeed >= 0) {
-                knobValue = currentSpeed / 1000f
+        // 1. START OF DAY SYNC: Only runs once when connection is established
+        LaunchedEffect(isConnected, currentSpeed) {
+            if (isConnected && !hasPerformedInitialSync && currentSpeed >= 0) {
+                val hardwareHz = currentSpeed / 1000f
+                Log.i("BLE_DEBUG", "START_OF_DAY: Initializing knob to hardware value: $hardwareHz")
+                knobValue = hardwareHz
+                hasPerformedInitialSync = true
             }
         }
 
-        // Debounce
+        // 2. DEBOUNCE
         LaunchedEffect(knobValue) {
-            // ONLY run this logic if we are NOT in landscape.
-            // This stops the 'Portrait' logic from shouting over the 'Landscape' logic.
             if (configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) {
                 delay(300)
-                onSpeedUpdate((knobValue * 1000).toInt())
+                val targetSpeed = (knobValue * 1000).toInt()
+
+                // Only send if we are actually playing or if the master switch is on
                 if (isPlayEnabled) {
-                    if (knobValue < 0.01f && isPlaying) {
-                        // Master is ON, but knob is at 0: Soft Stop
-                        this@MainActivity.isPlaying = false
-                        this@MainActivity.enqueueBoolean(PLAY_STOP_UUID, false)
-                    } else if (knobValue >= 0.01f && !isPlaying) {
-                        // Master is ON, and knob moved away from 0: Resume
-                        this@MainActivity.isPlaying = true
-                        enqueueBoolean(PLAY_STOP_UUID, true)
-                    }
+                    Log.d("BLE_DEBUG", "DEBOUNCE: Sending Speed $targetSpeed")
+                    onSpeedUpdate(targetSpeed)
                 }
             }
         }
@@ -1502,9 +1602,6 @@ class MainActivity : ComponentActivity() {
                     RotaryKnob(
                         value = knobValue,
                         onValueChange = { newValue ->
-                            // Update the interaction timer
-                            onUpdateTouchTime(System.currentTimeMillis())
-
                             // Update the state
                             knobValue = newValue
                         }
@@ -1515,16 +1612,19 @@ class MainActivity : ComponentActivity() {
                     Button(
                         modifier = Modifier.fillMaxWidth(0.6f),
                         onClick = {
-                            onUpdateTouchTime(System.currentTimeMillis())
                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                            // Toggle the Master Switch
+
+                            // 3. ENSURE SPEED IS SENT BEFORE PLAYING
+                            if (!isPlayEnabled) {
+                                // We are about to start playing
+                                val currentTarget = (knobValue * 1000).toInt()
+                                Log.i("BLE_DEBUG", "PLAY_PRESSED: Forcing speed $currentTarget before START")
+                                onSpeedUpdate(currentTarget)
+                            }
+
                             onTogglePlay(!isPlayEnabled)
                         }) {
-                        val buttonText = when {
-                            !isPlayEnabled -> "PLAY"            // Master is OFF
-                            else -> "STOP"                      // Master is ON and running
-                        }
-                        Text(buttonText)
+                        Text(if (!isPlayEnabled) "PLAY" else "STOP")
                     }
                 }
             }
@@ -1580,27 +1680,6 @@ class MainActivity : ComponentActivity() {
 
         Log.d("BLE_DEBUG", "Starting fresh hardware scan...")
         scanner?.startScan(null, settings, callback)
-    }
-
-    private fun enqueueBoolean(charUuid: UUID, value: Boolean) {
-        val bytes = if (value) listOf<Byte>(0x01) else listOf<Byte>(0x00)
-        commandQueue.trySend(BleCommand(charUuid, bytes))
-    }
-
-    private fun enqueueInt32(charUuid: UUID, value: Int) {
-        if (charUuid == SPEED_UUID) {
-            // Send to the conflated channel so we don't flood the BLE stack
-            speedChannel.trySend(value)
-        } else {
-            // For any other Int32 chars (if added later), use the standard queue
-            val bytes = listOf(
-                (value and 0xFF).toByte(),
-                ((value shr 8) and 0xFF).toByte(),
-                ((value shr 16) and 0xFF).toByte(),
-                ((value shr 24) and 0xFF).toByte()
-            )
-            commandQueue.trySend(BleCommand(charUuid, bytes))
-        }
     }
 
     fun calculateSpeedAtTime(timePercent: Float, nodes: List<AutomationNode>): Float {
