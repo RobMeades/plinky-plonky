@@ -567,21 +567,24 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        // Final safety stop
-        sendStopCommand()
+        // Send the stop command immediately (synchronous)
+        if (isConnected) {
+            Log.d("BLE_DEBUG", "onDestroy: Sending final stop command")
+            sendStopCommand()
+        }
 
-        // Give the BLE worker a tiny moment to flush the queue
-        // before we kill the GATT client.
-        lifecycleScope.launch {
-            delay(100)
+        // We want to disconnect NOW so the hardware sees the link drop
+        // after the stop command is buffered.
+        try {
             activeGatt?.let { gatt ->
                 gatt.disconnect()
                 gatt.close()
             }
             activeGatt = null
             isConnected = false
-            Log.d("BLE_DEBUG", "App destroyed: Resources released.")
-        }
+            Log.d("BLE_DEBUG", "onDestroy: Resources released synchronously.")
+        } catch (_: SecurityException) { }
+
         super.onDestroy()
     }
 
