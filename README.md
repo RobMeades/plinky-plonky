@@ -107,7 +107,7 @@ Bring up goes as follows:
 - plug a PC on which the [ESP-IDF software environment](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html) has been installed into the USB socket of the ESP32 board: a USB device should appear on the PC (e.g. `/dev/ttyACM0` on Linux); there is no need to plug external power into the plinky-plonky just yet as it should be able to draw sufficient power for these initial tests from the USB,
 - build the software that is contained in the [software/esp32](/software/esp32) directory and download it to the ESP32 via USB; if you have wired up different GPIO pins on the ESP32 to those in the schematic above, change the values in [Kconfig.projbuild](/software/esp32/main/Kconfig.projbuild) before compiling,
 - when the code runs on the ESP32 nothing much should happen, you will need an Android application for that, but if you see a splurge of "STALL" in the logged output of the ESP32 then you _do_ need to supply external power to the plinky-plonky,
-- either install the pre-built Android `.apk` from the [Releases](https://github.com/RobMeades/plinky-plonky/releases) section of this repository on an Android phone or, if you wish to build/modify the application yourself, follow the instructions in the [software/android](/software/android) directory; Android will show a `Play Protect` warning, which is normal for an independent, open-source project: to install, tap `More Details` and then `Install Anyway`,
+- either install the pre-built Android `.apk` from the [Releases](https://github.com/RobMeades/plinky-plonky/releases) section of this repository on an Android phone or, if you wish to build/modify the application yourself, follow the instructions in the [software/android](/software/android) directory; Android will show a `Play Protect` warning, which is normal for an independent, open-source project: to install tap `More Details` and then `Install Anyway`,
 - make sure you have Bluetooth enabled on the Android phone, hold the phone upright (portait orientation) and launch the application,
 - give the application the permissions it asks for (required to access Bluetooth) and, with the plinky-plonky powered-up, use the application to scan for and connect to the plinky-plonky; if the Android phone fails to find the plinky-plonky, try disabling and then re-enabling Bluetooth on the phone and trying again (Android Bluetooth is a mess),
 - press `Play` to have the motor run, `Stop` to stop it, adjust the speed using the knob or turn the phone landscape for the ability to generate complicated speed patterns,
@@ -117,7 +117,7 @@ Bring up goes as follows:
 - when you are satisfied that the plinky-plonky runs sweetly, push the 3D printed USB cover into the rectangular hole in the 3D printed body to prevent anything getting into the USB connector and proceed to "Finishing Off" below.
 
 # Finishing Off
-In order to give the plinky-plonky a solid yet resonant base:
+In order to give the plinky-plonky a solid yet resonant (in a good way) base:
 
 - cut two pieces of thin plywood to the shape of the 3D printed `base_outer` (see pictures below),
 - into one of these pieces drill three 3&nbsp;mm diameter holes to match the positions of the holes in the bottom of the 3D printed body, orienting that body nicely,
