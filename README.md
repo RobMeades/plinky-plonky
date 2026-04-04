@@ -1,7 +1,7 @@
 # Introduction
 For Christmas 2025 Santa brought Hazel a music box mechanism, henceforth referred to as a "plinky-plonky".  Since it was difficult to turn at speed, I did a quick [motorised version](https://www.youtube.com/watch?v=XHdWuA18UNk) with some bits I was able to get hold of quickly: a motor controller with a speed knob on it and a 5&nbsp;V motor which purported to be silent.  The motor was not silent at all.
 
-Since then I have made a [working Camberwick Green musical box](https://www.meades.org/misc/musical_box/musical_box.html) using one of these mechanisms, employing several varieties of stepper motor and a TMC2209 stepper motor controller.  Hence this repository contains the updated version of the motorised plink-plonky, employing a much quieter stepper motor, TMC2209, ESP32 and using Bluetooth for control.
+Since then I have made a [working Camberwick Green musical box](https://www.meades.org/misc/musical_box/musical_box.html) using one of these mechanisms, employing several varieties of stepper motor and a TMC2209 stepper motor controller.  Hence this repository describes how to make the updated version of the motorised plink-plonky, employing a much quieter stepper motor, TMC2209, ESP32 and using Bluetooth for control.
 
 In order to make this motorised plinky-plonky you will need to be able to:
 
@@ -41,27 +41,30 @@ The following parts are required:
 - a 15&nbsp;note plinky-plonky mechanism with fixing screws: the 3D printed parts are designed for one of [these](https://www.ebay.co.uk/itm/397247369927),
 - an ESP32 board with headers soldered-in on the component side: the 3D printed parts are designed for one of [these](https://www.aliexpress.com/item/1005005780805655.html), you could of course modify them to take any small ESP32 board,
 - a BigTreeTech TMC2209 board, i.e. one of [these](https://www.aliexpress.com/item/33028050145.html), any "sticky out" pins on the reverse lopped off and heatsink fitted,
-- a 12&nbsp;to&nbsp;24&nbsp;V&nbsp;DC to 5&nbsp;V&nbsp;DC regulator: the 3D printed parts are designed for one of [these](https://www.aliexpress.com/item/1005010692851197.html), you could of course modify them to take any small regulator board; the current requirements for the 5&nbsp;V supply are negligible,
+- a 12/24&nbsp;V&nbsp;DC to 5&nbsp;V&nbsp;DC regulator: the 3D printed parts are designed for one of [these](https://www.aliexpress.com/item/1005010692851197.html), you could of course modify them to take any small regulator board; the current requirements for the 5&nbsp;V supply are negligible,
 - a NEMA17 stepper motor: the 3D printed parts are designed for one of [these](https://www.amazon.co.uk/dp/B0D7PBB17L), frame size 42&nbsp;mm&nbsp;x&nbsp;42&nbsp;mm with M3 threaded mounting holes, frame 20&nbsp;mm deep, shaft 5&nbsp;mm diameter and 20&nbsp;mm long, with flat,
-- a centre-positive plug-top power supply capable of delivering up to 2&nbsp;Amps at between 12&nbsp;and&nbsp;24&nbsp;V&nbsp;DC, terminating in a 2.1&nbsp;mm&nbsp;x&nbsp;5.5&nbsp;mm connector,
+- an AC mains plug-top power supply capable of delivering up to 2&nbsp;Amps at between 12&nbsp;and&nbsp;24&nbsp;V&nbsp;DC, terminating in a 5.5&nbsp;mm diameter barrel connector with a 2.1&nbsp;mm diameter pin, centre-positive,
 - an M3 hex-head grub screw (any length, the longer the better),
 - 2 off M3&nbsp;x&nbsp;5&nbsp;mm hex head bolts,
 - 3 off M3&nbsp;x&nbsp;10&nbsp;mm hex head bolts,
 - 4 off M3&nbsp;x&nbsp;5&nbsp;mm pan head bolts,
-- 3 off M3 x&nbsp;10&nbsp;mm to x&nbsp;15&nbsp;mm pan head bolts,
-- a 2.1&nbsp;mm&nbsp;x&nbsp;5.5&nbsp;mm panel-mount power socket,
+- 3 off M3&nbsp;x&nbsp;10&nbsp;mm to 15&nbsp;mm pan head bolts,
+- a panel-mount DC power socket with 2.1&nbsp;mm diameter pin, 5.5&nbsp;mm diameter barrel outer,
 - 1 off 1&nbsp;kOhm resistor,
 - a small amount of 7-strand wire in  a few shades of red/orange if you can (input DC Voltage, 5&nbsp;V and 3.3&nbsp;V), black and a signal colour of your choice (e.g. yellow or white or blue),
-- some 3&nbsp;mm diameter heat-shrink,
+- a small amount (e.g. 100&nbsp;mm) of 3&nbsp;mm diameter heat-shrink,
+- a small amount of flux-cored solder,
 - 0.1&nbsp;inch pitch housings (1-way, 2-way and 4-way) plus female pins to go with,
-- a small number of small sticky pads,
-- a small amount of thin (e.g. 3&nbsp;mm thick) plywood,
+- 2 off pieces (e.g. 10&nbsp;mm square) of double-sided sticky pad, tape or individual pads,
+- a small amount (e.g. 400&nbsp;x&nbsp;250&nbsp;mm) of thin (e.g. 3&nbsp;mm thick) plywood,
 - a small amount of wide (e.g. 30&nbsp;mm wide) edging that matches the plywood,
 - optional: 1 off 4&nbsp;x&nbsp;8&nbsp;x&nbsp;3&nbsp;mm (inside diameter x outside diameter x thickness) bearing: I found that the sheath on the handle of the plinky-plonky mechanism rattled irritatingly so I took it off and slotted the handle into one of these bearings in the 3D printed wheel instead,
 - PVA glue,
 - possibly a little cyanoacrylate glue (AKA superglue),
 - varnish or paint of your choice,
-- optional: a small amount of metallic paint (e.g. Humbrol&nbsp;11).
+- a small amount of metallic paint (e.g. Humbrol&nbsp;11),
+- optional: stick-on felt pads,
+- optional: some 0.5&nbsp;kg lead weights e.g. [these from eBay](https://www.ebay.co.uk/itm/145559704455).
 
 # Assembly Instructions
 Assembly goes as follows (see also pictures below):
@@ -79,9 +82,9 @@ Assembly goes as follows (see also pictures below):
 - screw the grub screw into the 3D printed wheel against the flat of the stepper motor spindle, making sure that there is a gap between the wheel and the stepper motor mounting bracket as you tighten the grub screw,
 - using some 7-strand signal wire and heat-shrink as appropriate, make a short "Y" assembly with the 1&nbsp;kOhm resistor in series with one of the legs of the Y, all legs terminated in single 0.1&nbsp;inch pitch connectors (see picture below),
 - using this, the remaining 7-strand wire and the 0.1&nbsp;inch pitch connectors, wire up the ESP32 board, the TMC2209 board and the stepper motor according to the schematic below, bringing 5&nbsp;V from the output of the voltage regulator and 12&nbsp;to&nbsp;24&nbsp;V from the input of the voltage regulator (you may chose different IO pins on the ESP32 board if you wish, these will be set later when the software for the ESP32 is compiled, though note that pin&nbsp;8 is not used since there is a blue LED on the board connected to this pin and pin&nbsp;20 is not used as it is internally connected to the RF inside the chip),
-- wire the panel-mount power socket to the input of the voltage regulator board, with the central pin of the panel mount socket to the positive,
+- wire the panel-mount power socket to the input of the voltage regulator board, with the central pin of the panel mount socket to the positive, adding heat-shrink to cover any exposed connector (since there is little room in the box),
 - fit the panel-mount power socket into its mounting hole in the 3D printed body,
-- plug a 12&nbsp;to&nbsp;24&nbsp;V DC plug-top power supply into the power socket and you should see a red light on the ESP32 board,
+- plug an AC mains 12&nbsp;/nbsp;24&nbsp;V DC plug-top power supply into the power socket and you should see a red light on the ESP32 board,
 - fix the 3D printed stepper motor cover to the stepper motor mounting bracket with two of the M3&nbsp;x&nbsp;10&nbsp;mm hex head bolts,
 - fix the 3D printed lid into position over the electronics with the remaining M3&nbsp;x&nbsp;10&nbsp;mm hex head bolt,
 - proceed to "Bring Up" below.
@@ -109,6 +112,8 @@ Bring up goes as follows:
 - give the application the permissions it asks for (required to access Bluetooth) and, with the plinky-plonky powered-up, use the application to scan for and connect to the plinky-plonky; if the Android phone fails to find the plinky-plonky, try disabling and then re-enabling Bluetooth on the phone and trying again (Android Bluetooth is a mess),
 - press `Play` to have the motor run, `Stop` to stop it, adjust the speed using the knob or turn the phone landscape for the ability to generate complicated speed patterns,
 - if you find that the plinky-plonky rattles at certain speeds, even when you have used the bearing approach, that will likely be because the handle can be slightly loose in the bearing: should that be the case, drop a _very_ tiny amount of cyanoacrylate glue between the handle and the inner face of the bearing to stop it rattling around, being _extremely_ careful not to get any glue on the runners of the bearing as you do so,
+- rattles/resonance can also be removed by going around and gently tighting the fixing bolts,
+- if that fails, since resonances can be in different components at different frequencies, I purchased some lead weights and kept three to hand for placing on whatever bit of the plinky-plonky needed damping at that running frequency (obviously wash your hands after handling lead),
 - when you are satisfied that the plinky-plonky runs sweetly, push the 3D printed USB cover into the rectangular hole in the 3D printed body to prevent anything getting into the USB connector and proceed to "Finishing Off" below.
 
 # Finishing Off
@@ -122,8 +127,10 @@ In order to give the plinky-plonky a solid yet resonant base:
 - when the glue has set, rub the whole thing down with fine sandpaper,
 - varnish/finish in whatever way pleases you,
 - to make the next step easier, create the threads in each of the holes in the bottom of the 3D printed body using one of the longer M3 pan head bolts,
-- using the access holes to get at the 3&nbsp;mm diameter holes, attach the wooden/plastic base to the bottom of the 3D printed body with the longer M3 pan head bolts; a magnetic flat-head screwdriver is your friend.
+- using the access holes to get at the 3&nbsp;mm diameter holes, attach the wooden/plastic base to the bottom of the 3D printed body with the longer M3 pan head bolts; a magnetic flat-head screwdriver is your friend,
+- if you find that the plink-plonky resonates somewhat when running placed on a hard surface, stick-on felt pads or rubber feet help.
 
 Finally, pick out the lettering embossed into the 3D printed stepper motor cover in metallic paint using a very fine modeller's paint brush.
 
 <img src="/pictures_for_readme/plywood_cut_and_drilled.jpg" alt="Plywood cut and drilled" style="width:29%; height:auto;"> <img src="/pictures_for_readme/box.jpg" alt="Box, varnished" style="width:30%; height:auto;"> <img src="/pictures_for_readme/completed.jpg" alt="Completed" style="width:38%; height:auto;">
+
