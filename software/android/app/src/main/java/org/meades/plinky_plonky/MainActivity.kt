@@ -17,19 +17,20 @@
 /* This written by Google Gemini from my prompts, over several days
  * with several arguments/disagreements and not a few regressions
  * and "imaginative" outcomes along the way.  Some hints for future
- * Rob to avoid datoius and very long nights:
+ * Rob to avoid detours and very long nights:
  *
- * - if you ask a general question, check, check and check the
+ * - if you ask a general question, check, check and check again the
  *   answer,
  * - if you provide a large amount of text as a basis for a
- *   question (e.g. a source file), same: beware hallucinations,
+ *   question (e.g. a source file), do the same: beware
+ *   skim reading,
  * - if offered an assertion about code behaviour and you
- *   have the slightest sniff of doubt, ask for a version
- *   of code that only has debug added to it and provide
- *   that debug back as evidence: debug is usually
- *   smaller and more focussed, dampens hallucinations.
+ *   have the slightest whiff of a doubt, ask for a version
+ *   of code that only has run-time debug prints added to it and
+ *   provide that debug back as evidence: debug text is usually
+ *   smaller and more focussed, it dampens hallucinations.
  *
- * */
+ */
 
 package org.meades.plinky_plonky
 
@@ -236,10 +237,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // BLE channel management
     private val bleMutex = kotlinx.coroutines.sync.Mutex()
     private var completionDeferred: CompletableDeferred<Int>? = null
-    // A conflated channel only keeps the LATEST value, dropping older ones automatically
 
+    // The permissions nightmare
     private fun hasRequiredPermissions(): Boolean {
         val perms = arrayOf(android.Manifest.permission.BLUETOOTH_SCAN, android.Manifest.permission.BLUETOOTH_CONNECT)
         return perms.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
@@ -330,6 +332,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Wot it says
     private fun sendStopCommand() {
         // We only send this if we are actually connected
         if (isConnected) {
@@ -437,6 +440,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // More BLE management
     private fun refreshDeviceCache(gatt: BluetoothGatt): Boolean {
         return try {
             val method = gatt.javaClass.getMethod("refresh")
@@ -449,14 +453,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Save to file
     private val exportJsonLauncher = registerForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
         uri?.let { saveJsonToUri(it) }
     }
 
+    // Load from file
     private val importJsonLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { loadJsonFromUri(it) }
     }
 
+    // Save to file process
     private fun saveJsonToUri(uri: android.net.Uri) {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
@@ -488,6 +495,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Load from file process
     private fun loadJsonFromUri(uri: android.net.Uri) {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
