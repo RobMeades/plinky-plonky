@@ -3,6 +3,8 @@ For Christmas 2025 Santa brought Hazel a music box mechanism, henceforth referre
 
 Since then I have made a [working Camberwick Green musical box](https://www.meades.org/misc/musical_box/musical_box.html) using one of these mechanisms, employing several varieties of stepper motor and a TMC2209 stepper motor controller.  Hence this repository describes how to make the updated version of the motorised plink-plonky, employing a much quieter stepper motor, TMC2209, ESP32 and using Bluetooth for control.
 
+You can find a video of it in action on [YouTube](https://youtu.be/Unc9a-GsFBE); read on to find out what the lead weights are for.
+
 In order to make this motorised plinky-plonky you will need to be able to:
 
 - 3D print in FDM,
