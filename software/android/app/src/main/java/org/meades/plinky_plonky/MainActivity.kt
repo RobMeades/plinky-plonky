@@ -87,7 +87,13 @@ import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.lifecycle.lifecycleScope
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.delay
@@ -1297,10 +1303,10 @@ class MainActivity : ComponentActivity() {
                             onValueChange = { saveNameInput = it },
                             label = { Text("Sequence Name") },
                             singleLine = true,
-                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                                imeAction = androidx.compose.ui.text.input.ImeAction.Done
+                            keyboardOptions = KeyboardOptions(
+                                imeAction = ImeAction.Done
                             ),
-                            keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                            keyboardActions = KeyboardActions(
                                 onDone = {
                                     if (saveNameInput.isNotBlank()) {
                                         saveSequence(context, saveNameInput, nodes, durationSeconds, curveTension)
@@ -1546,12 +1552,16 @@ class MainActivity : ComponentActivity() {
     ) {
         val haptics = LocalHapticFeedback.current
         val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+        val focusManager = LocalFocusManager.current
+        var textFieldValue by remember(knobValue) {
+            mutableStateOf(String.format(Locale.getDefault(), "%.2f", knobValue))
+        }
 
         // 1. START OF DAY SYNC: Only runs once when connection is established
         LaunchedEffect(isConnected, currentSpeed) {
             if (isConnected && !hasPerformedInitialSync && currentSpeed >= 0) {
                 val hardwareHz = currentSpeed / 1000f
-                Log.i("BLE_DEBUG", "START_OF_DAY: Initializing knob to hardware value: $hardwareHz")
+                Log.i("BLE_DEBUG", "START_OF_DAY: initializing knob to hardware value: $hardwareHz")
                 knobValue = hardwareHz
                 hasPerformedInitialSync = true
             }
@@ -1565,7 +1575,7 @@ class MainActivity : ComponentActivity() {
 
                 // Only send if we are actually playing or if the master switch is on
                 if (isPlayEnabled) {
-                    Log.d("BLE_DEBUG", "DEBOUNCE: Sending Speed $targetSpeed")
+                    Log.d("BLE_DEBUG", "DEBOUNCE: sending Speed $targetSpeed")
                     onSpeedUpdate(targetSpeed)
                 }
             }
@@ -1595,14 +1605,48 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxWidth(),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text(
-                        text = if (knobValue < 0.01f) "STOPPED" else String.format(
-                            Locale.getDefault(),
-                            "%.2f Hz",
-                            knobValue
+                    OutlinedTextField(
+                        value = textFieldValue,
+                        onValueChange = { newValue ->
+                            // Filter: only digits and one decimal
+                            val filtered = newValue.filter { it.isDigit() || it == '.' }
+                            if (filtered.count { it == '.' } <= 1) {
+                                textFieldValue = filtered
+                            }
+                        },
+                        // Using a fixed width to keep it compact
+                        modifier = Modifier.width(130.dp),
+                        textStyle = MaterialTheme.typography.headlineSmall.copy(
+                            textAlign = TextAlign.Center
                         ),
-                        style = MaterialTheme.typography.headlineLarge,
-                        color = if (knobValue < 0.01f) Color.Red else Color.Black
+                        suffix = { Text("Hz") },
+                        singleLine = true,
+                        isError = (textFieldValue.toFloatOrNull() ?: 0f) > SPEED_MAX_HERTZ,
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Decimal,
+                            imeAction = ImeAction.Done
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onDone = {
+                                val parsedValue = textFieldValue.toFloatOrNull()
+                                if (parsedValue != null) {
+                                    val validatedValue = parsedValue.coerceIn(0f, SPEED_MAX_HERTZ)
+                                    knobValue = validatedValue
+                                    onSpeedUpdate((validatedValue * 1000).toInt())
+                                    textFieldValue = String.format(Locale.getDefault(), "%.2f", validatedValue)
+                                } else {
+                                    textFieldValue = String.format(Locale.getDefault(), "%.2f", knobValue)
+                                }
+                                focusManager.clearFocus() // Hides cursor and keyboard
+                            }
+                        ),
+                        colors = TextFieldDefaults.colors(
+                            focusedTextColor = if (knobValue < 0.01f) Color.Red else Color.Black,
+                            unfocusedTextColor = if (knobValue < 0.01f) Color.Red else Color.Black,
+                            focusedContainerColor = Color.Transparent,
+                            unfocusedContainerColor = Color.Transparent,
+                            cursorColor = if (knobValue < 0.01f) Color.Red else Color.Black
+                        )
                     )
 
                     Spacer(modifier = Modifier.height(16.dp))
@@ -1610,8 +1654,11 @@ class MainActivity : ComponentActivity() {
                     RotaryKnob(
                         value = knobValue,
                         onValueChange = { newValue ->
-                            // Update the state
+                            // Clear focus if user touches the knob while typing
+                            focusManager.clearFocus()
+
                             knobValue = newValue
+                            textFieldValue = String.format(Locale.getDefault(), "%.2f", newValue)
                         }
                     )
 
@@ -1620,16 +1667,13 @@ class MainActivity : ComponentActivity() {
                     Button(
                         modifier = Modifier.fillMaxWidth(0.6f),
                         onClick = {
+                            focusManager.clearFocus() // Also clear focus when pressing Play/Stop
                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
 
-                            // 3. ENSURE SPEED IS SENT BEFORE PLAYING
                             if (!isPlayEnabled) {
-                                // We are about to start playing
                                 val currentTarget = (knobValue * 1000).toInt()
-                                Log.i("BLE_DEBUG", "PLAY_PRESSED: Forcing speed $currentTarget before START")
                                 onSpeedUpdate(currentTarget)
                             }
-
                             onTogglePlay(!isPlayEnabled)
                         }) {
                         Text(if (!isPlayEnabled) "PLAY" else "STOP")
@@ -1642,7 +1686,7 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("MissingPermission")
     private fun startReliableScan(onDeviceFound: (BluetoothDevice) -> Unit) {
         if (!hasRequiredPermissions()) {
-            Log.d("BLE_DEBUG", "Scan aborted: Permissions not yet granted.")
+            Log.d("BLE_DEBUG", "Scan aborted: permissions not yet granted.")
             return
         }
 
